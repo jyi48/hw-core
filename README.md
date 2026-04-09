@@ -47,3 +47,11 @@ ros2 run inspire_hand_driver inspire_hand_driver \
 | `/rt/inspire_hand/ctrl/l` | `InspireHandCtrl` | subscribe |
 | `/rt/inspire_hand/state/r` | `InspireHandState` | publish |
 | `/rt/inspire_hand/state/l` | `InspireHandState` | publish |
+
+## Author
+
+Jaehyun Yi
+
+## References
+
+- https://github.com/NaCl-1374/inspire_hand_ws
