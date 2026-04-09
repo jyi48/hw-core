@@ -20,21 +20,14 @@ namespace reg
   constexpr int FORCE_SET = 1498;
   constexpr int SPEED_SET = 1522;
 
-  // read — 2번 블록으로 묶기
-  // block1 (short): 1534~1599, 66개
-  constexpr int BLOCK1_START = 1534;
-  constexpr int BLOCK1_LEN   = 66;
-  constexpr int OFF_POS_ACT   = 0;   // 1534
-  constexpr int OFF_ANGLE_ACT = 12;  // 1546
-  constexpr int OFF_FORCE_ACT = 48;  // 1582
-  constexpr int OFF_CURRENT   = 60;  // 1594
-
-  // block2 (byte): 1606~1620, 15개 레지스터 → 30 bytes
-  constexpr int BLOCK2_START  = 1606;
-  constexpr int BLOCK2_LEN    = 15;
-  constexpr int OFF_ERR        = 0;   // 1606 → bytes 0-5
-  constexpr int OFF_STATUS     = 12;  // 1612 → bytes 12-17
-  constexpr int OFF_TEMP       = 24;  // 1618 → bytes 24-29
+  // read (각 필드 개별 read — 빈 레지스터 오염 방지)
+  constexpr int POS_ACT   = 1534;
+  constexpr int ANGLE_ACT = 1546;
+  constexpr int FORCE_ACT = 1582;
+  constexpr int CURRENT   = 1594;
+  constexpr int ERR       = 1606;
+  constexpr int STATUS    = 1612;
+  constexpr int TEMP      = 1618;
 
   constexpr int RESET_ERR = 1004;
 }

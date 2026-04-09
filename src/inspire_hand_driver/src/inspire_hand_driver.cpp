@@ -140,21 +140,24 @@ void InspireHandDriver::do_write(Hand & hand, const CtrlMsg & msg)
 void InspireHandDriver::do_read_publish(Hand & hand)
 {
   try {
-    // block1: 1534~1599 (66개 short) — pos_act, angle_act, force_act, current
-    auto b1 = hand.modbus->read_registers_short(reg::BLOCK1_START, reg::BLOCK1_LEN);
-    // block2: 1606~1620 (15개 레지스터 → 30 bytes) — err, status, temp
-    auto b2 = hand.modbus->read_registers_byte(reg::BLOCK2_START, reg::BLOCK2_LEN);
+    auto pos_act   = hand.modbus->read_registers_short(reg::POS_ACT,   6);
+    auto angle_act = hand.modbus->read_registers_short(reg::ANGLE_ACT, 6);
+    auto force_act = hand.modbus->read_registers_short(reg::FORCE_ACT, 6);
+    auto current   = hand.modbus->read_registers_short(reg::CURRENT,   6);
+    auto err       = hand.modbus->read_registers_byte(reg::ERR,     3);
+    auto status    = hand.modbus->read_registers_byte(reg::STATUS,  3);
+    auto temp      = hand.modbus->read_registers_byte(reg::TEMP,    3);
 
     StateMsg msg;
     for (int i = 0; i < 6; ++i) {
-      msg.pos_act[i]   = b1[reg::OFF_POS_ACT   + i];
-      msg.angle_act[i] = b1[reg::OFF_ANGLE_ACT + i];
-      msg.force_act[i] = b1[reg::OFF_FORCE_ACT + i];
-      msg.current[i]   = b1[reg::OFF_CURRENT   + i];
+      msg.pos_act[i]   = pos_act[i];
+      msg.angle_act[i] = angle_act[i];
+      msg.force_act[i] = force_act[i];
+      msg.current[i]   = current[i];
 
-      msg.err[i]         = b2[reg::OFF_ERR    + i];
-      msg.status[i]      = b2[reg::OFF_STATUS + i];
-      msg.temperature[i] = b2[reg::OFF_TEMP   + i];
+      msg.err[i]         = err[i];
+      msg.status[i]      = status[i];
+      msg.temperature[i] = temp[i];
     }
     hand.state_pub->publish(msg);
 
