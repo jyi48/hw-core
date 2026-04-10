@@ -26,9 +26,8 @@ find_package(Threads REQUIRED)
 add_executable(rby1_rt_node rby1_rt_node.cpp)
 
 target_link_libraries(rby1_rt_node
-  PRIVATE
-    rby1-sdk::rby1-sdk
-    Threads::Threads
+  rby1-sdk::rby1-sdk
+  Threads::Threads
 )
 
 ament_target_dependencies(rby1_rt_node
