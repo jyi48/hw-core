@@ -13,7 +13,6 @@
  *   - All /rby1_command action strings handled
  *   - /rby1_status JSON matches small_main parse keys
  *   - /rby1_status_joint, /rby1_teleop_command, /rby1_impedance_teleop_command
- *   - /rby1_pink_teleop_command (PoseArray) subscribed
  */
 
 #include <pthread.h>
@@ -47,6 +46,10 @@
 using namespace rb;
 using namespace rb::y1_model;
 
+// SDK dynamics types: dyn::Robot<DOF> / dyn::State<DOF>
+using DynRobot = dyn::Robot<A::kRobotDOF>;
+using DynState = dyn::State<A::kRobotDOF>;
+
 static constexpr double kStreamDt   = 0.02;   // 50 Hz
 static constexpr int    kNumBody    = 20;      // 6 torso + 7 rarm + 7 larm
 static constexpr int    kNumWheel   = 2;
@@ -63,7 +66,6 @@ static void set_rt_priority(int priority = 80) {
     RCLCPP_WARN(rclcpp::get_logger("rby1_rt"), "RT priority failed (need CAP_SYS_NICE)");
 }
 
-// Absolute-time sleep — no drift accumulation
 static void sleep_until_abs(struct timespec& next, long dt_ns) {
   next.tv_nsec += dt_ns;
   while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
@@ -103,20 +105,22 @@ struct JointTeleopController {
     new_cmd = true;
   }
 
-  // Returns true and fills out if a new command is ready.
-  // Returns false → caller should send hold command.
-  bool compute(const RobotState<A>& rs, Dynamics<A>& dyn, DynamicsState<A>& ds,
-               double dt, JointGroupCommandBuilder& out) {
+  // Fills `out` and returns true when a new command is ready.
+  // Returns false → caller sends hold command.
+  bool compute(const RobotState<A>& rs,
+               DynRobot& dyn,
+               const std::shared_ptr<DynState>& ds,
+               double dt,
+               JointPositionCommandBuilder& out) {
     if (traj_dt_cnt == 0) {
       auto ub  = dyn.GetLimitQUpper(ds);
       auto lb  = dyn.GetLimitQLower(ds);
       auto dq  = dyn.GetLimitQdotUpper(ds);
       auto ddq = dyn.GetLimitQddotUpper(ds);
       for (int i = 0; i < kNumBody; ++i) {
-        max_q[i]  = ub[kNumWheel+i];  min_q[i]  = lb[kNumWheel+i];
-        max_dq[i] = dq[kNumWheel+i];  max_ddq[i] = ddq[kNumWheel+i];
+        max_q[i]   = ub[kNumWheel+i];  min_q[i]   = lb[kNumWheel+i];
+        max_dq[i]  = dq[kNumWheel+i];  max_ddq[i] = ddq[kNumWheel+i];
       }
-      // arm joints: relax velocity/acceleration limits (matching Python reference)
       for (int i = 6; i < kNumBody; ++i) { max_dq[i] *= 10.; max_ddq[i] *= 30.; }
       for (int i = 0; i < kNumBody; ++i) {
         q[i] = rs.position[kNumWheel+i];
@@ -171,8 +175,7 @@ struct JointImpedanceTeleopController {
   double gripper_ref[2]{0., 0.};
   double gripper_pos[2]{0., 0.};
 
-  // Cached target position for no-new-command hold (stays in impedance mode)
-  bool   imp_ref_set{false};
+  bool imp_ref_set{false};
   Eigen::VectorXd q_ref_imp{Eigen::VectorXd::Zero(kNumBody)};
 
   std::mutex mtx;
@@ -185,10 +188,11 @@ struct JointImpedanceTeleopController {
     new_cmd = true;
   }
 
-  // Fills out_active if a new command is ready (impedance tracking).
-  // Fills out_hold  if no new command — impedance hold at cached reference.
-  // Returns true if out_active was filled, false if out_hold was filled.
-  bool compute(const RobotState<A>& rs, Dynamics<A>& dyn, DynamicsState<A>& ds,
+  // Fills out_active (new cmd) or out_hold (impedance hold at cached ref).
+  // Returns true if out_active was filled.
+  bool compute(const RobotState<A>& rs,
+               DynRobot& dyn,
+               const std::shared_ptr<DynState>& ds,
                double dt,
                BodyComponentBasedCommandBuilder& out_active,
                BodyComponentBasedCommandBuilder& out_hold) {
@@ -207,43 +211,36 @@ struct JointImpedanceTeleopController {
       imp_ref_set = false;
     }
 
-    const Eigen::Vector<double, 7> K   = (Eigen::Vector<double,7>() << 80,80,80,80,80,80,40).finished();
-    const Eigen::Vector<double, 7> tq  = (Eigen::Vector<double,7>() << 35,35,35,20,20,20,15).finished();
-    constexpr double zeta = 1.0;
+    const Eigen::Vector<double,7> K  = (Eigen::Vector<double,7>() << 80,80,80,80,80,80,40).finished();
+    const Eigen::Vector<double,7> tq = (Eigen::Vector<double,7>() << 35,35,35,20,20,20,15).finished();
 
-    auto make_impedance_bc = [&](const Eigen::VectorXd& qc, BodyComponentBasedCommandBuilder& bc) {
+    auto fill_bc = [&](BodyComponentBasedCommandBuilder& bc, const Eigen::VectorXd& qc) {
       Eigen::Map<const Eigen::VectorXd> ra(qc.data()+6,  7);
       Eigen::Map<const Eigen::VectorXd> la(qc.data()+13, 7);
       Eigen::Map<const Eigen::VectorXd> to(qc.data(),    6);
-      bc.SetRightArmCommand(
-            JointImpedanceControlCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(dt*30))
-              .SetPosition(ra).SetMinimumTime(dt*2)
-              .SetStiffness(K).SetDampingRatio(zeta).SetTorqueLimit(tq))
-         .SetLeftArmCommand(
-            JointImpedanceControlCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(dt*30))
-              .SetPosition(la).SetMinimumTime(dt*2)
-              .SetStiffness(K).SetDampingRatio(zeta).SetTorqueLimit(tq))
-         .SetTorsoCommand(
-            JointPositionCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(dt*30))
-              .SetPosition(to).SetMinimumTime(dt*2));
+      JointImpedanceControlCommandBuilder ra_cmd, la_cmd;
+      ra_cmd.SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(dt*30))
+            .SetPosition(ra).SetMinimumTime(dt*2).SetStiffness(K).SetDampingRatio(1.0).SetTorqueLimit(tq);
+      la_cmd.SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(dt*30))
+            .SetPosition(la).SetMinimumTime(dt*2).SetStiffness(K).SetDampingRatio(1.0).SetTorqueLimit(tq);
+      JointPositionCommandBuilder to_cmd;
+      to_cmd.SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(dt*30))
+            .SetPosition(to).SetMinimumTime(dt*2);
+      bc.SetRightArmCommand(ra_cmd).SetLeftArmCommand(la_cmd).SetTorsoCommand(to_cmd);
     };
 
     if (!new_cmd) {
-      // Hold in impedance mode — cache robot's target_position on first hold
       if (!imp_ref_set) {
         q_ref_imp.resize(kNumBody);
         for (int i = 0; i < kNumBody; ++i)
           q_ref_imp[i] = rs.target_position[kNumWheel+i];
         imp_ref_set = true;
       }
-      make_impedance_bc(q_ref_imp, out_hold);
+      fill_bc(out_hold, q_ref_imp);
       return false;
     }
-    new_cmd = false;
-    imp_ref_set = false;  // next hold will re-cache from fresh target_position
+    new_cmd     = false;
+    imp_ref_set = false;
     {
       std::lock_guard<std::mutex> lk(mtx);
       for (int i = 0; i < 7; ++i) q[6 +i] = cmd_array[i];
@@ -264,7 +261,7 @@ struct JointImpedanceTeleopController {
     Eigen::VectorXd qc(kNumBody);
     for (int i = 0; i < kNumBody; ++i)
       qc[i] = std::clamp(q_filtered[i], min_q[i], max_q[i]);
-    make_impedance_bc(qc, out_active);
+    fill_bc(out_active, qc);
     traj_dt_cnt++;
     return true;
   }
@@ -316,36 +313,29 @@ class Rby1RtNode : public rclcpp::Node {
   }
 
  private:
-  // SDK
   std::shared_ptr<Robot<A>>                     robot_;
   std::unique_ptr<RobotCommandStreamHandler<A>> stream_;
-  std::shared_ptr<Dynamics<A>>                  dyn_;
-  std::shared_ptr<DynamicsState<A>>             dyn_state_;
+  std::shared_ptr<DynRobot>                     dyn_;
+  std::shared_ptr<DynState>                     dyn_state_;
 
-  // Cached robot state from StartStateUpdate callback (SDK thread → RT thread)
   std::shared_ptr<const RobotState<A>> cached_state_;
   std::mutex state_mtx_;
 
-  // Atomics: safe across SDK / RT / action threads
   std::atomic<bool> stream_enabled_{false};
   std::atomic<bool> robot_ok_{false};
   std::atomic<bool> no_gripper_{true};
-  // Power/servo flags cached in cmd_* — avoids gRPC calls inside 50Hz on_state()
   std::atomic<bool> power_on_{false};
   std::atomic<bool> servo_on_{false};
 
-  // ctr_type_: read from RT thread + on_state(), written from action thread → mutex
   std::string ctr_type_{"JointPosition"};
   std::mutex  ctr_type_mtx_;
 
   JointTeleopController          ctrl_jp_;
   JointImpedanceTeleopController ctrl_jip_;
 
-  // Mobility
   double x_speed_{0.}, y_speed_{0.}, yaw_speed_{0.};
   int    base_cnt_{0};
 
-  // ROS handles
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr sub_base_vel_;
   rclcpp::Subscription<interbotix_xs_msgs::msg::JointGroupCommand>::SharedPtr sub_teleop_, sub_imp_teleop_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr sub_pink_teleop_;
@@ -364,7 +354,7 @@ class Rby1RtNode : public rclcpp::Node {
     while (rclcpp::ok()) {
       if (!stream_enabled_) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        clock_gettime(CLOCK_MONOTONIC, &next);  // reset abs timer after idle
+        clock_gettime(CLOCK_MONOTONIC, &next);
         continue;
       }
 
@@ -379,39 +369,40 @@ class Rby1RtNode : public rclcpp::Node {
         base_cnt_ = static_cast<int>(kStopWheelT / kStreamDt * 2);
       }
       Eigen::Vector2d lv(x_speed_, y_speed_);
-      auto mc = MobilityCommandBuilder().SetCommand(
-          SE2VelocityCommandBuilder().SetVelocity(lv, yaw_speed_)
-              .SetMinimumTime(kStreamDt * 5)
-              .SetAccelerationLimit(Eigen::Vector2d::Constant(10.), 10.));
+      MobilityCommandBuilder mc;
+      mc.SetCommand(SE2VelocityCommandBuilder()
+          .SetVelocity(lv, yaw_speed_)
+          .SetMinimumTime(kStreamDt * 5)
+          .SetAccelerationLimit(Eigen::Vector2d::Constant(10.), 10.));
 
-      // Snapshot ctr_type_ under lock — avoids data race with action thread
       std::string ctr;
       { std::lock_guard<std::mutex> lk(ctr_type_mtx_); ctr = ctr_type_; }
 
       RobotCommandBuilder rc;
 
       if (ctr == "JointPosition") {
-        JointGroupCommandBuilder bc;
-        if (ctrl_jp_.compute(*rs, *dyn_, *dyn_state_, kStreamDt, bc)) {
-          rc = RobotCommandBuilder().SetCommand(
-              ComponentBasedCommandBuilder().SetBodyCommand(bc).SetMobilityCommand(mc));
+        JointPositionCommandBuilder bc;
+        if (ctrl_jp_.compute(*rs, *dyn_, dyn_state_, kStreamDt, bc)) {
+          ComponentBasedCommandBuilder cbc;
+          cbc.SetBodyCommand(bc).SetMobilityCommand(mc);
+          rc.SetCommand(cbc);
         } else {
-          // Hold: use target_position (last commanded reference — smoother than encoder)
+          // Hold: use target_position (smoother than encoder reading)
           Eigen::VectorXd qh(kNumBody);
           for (int i = 0; i < kNumBody; ++i) qh[i] = rs->target_position[kNumWheel+i];
-          auto hold = JointPositionCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
+          JointPositionCommandBuilder hold;
+          hold.SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
               .SetPosition(qh).SetMinimumTime(kStreamDt*10);
-          rc = RobotCommandBuilder().SetCommand(
-              ComponentBasedCommandBuilder().SetBodyCommand(hold).SetMobilityCommand(mc));
+          ComponentBasedCommandBuilder cbc;
+          cbc.SetBodyCommand(hold).SetMobilityCommand(mc);
+          rc.SetCommand(cbc);
         }
       } else if (ctr == "JointImpedance") {
         BodyComponentBasedCommandBuilder bc_active, bc_hold;
-        bool has_new = ctrl_jip_.compute(*rs, *dyn_, *dyn_state_, kStreamDt, bc_active, bc_hold);
-        // Both cases stay in impedance mode — bc_active tracks new cmd, bc_hold holds last ref
-        auto& bc = has_new ? bc_active : bc_hold;
-        rc = RobotCommandBuilder().SetCommand(
-            ComponentBasedCommandBuilder().SetBodyCommand(bc).SetMobilityCommand(mc));
+        bool has_new = ctrl_jip_.compute(*rs, *dyn_, dyn_state_, kStreamDt, bc_active, bc_hold);
+        ComponentBasedCommandBuilder cbc;
+        cbc.SetBodyCommand(has_new ? bc_active : bc_hold).SetMobilityCommand(mc);
+        rc.SetCommand(cbc);
       } else {
         RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 5000, "Unknown ctr_type: %s", ctr.c_str());
         sleep_until_abs(next, dt_ns);
@@ -423,7 +414,6 @@ class Rby1RtNode : public rclcpp::Node {
       } catch (const std::exception& e) {
         RCLCPP_ERROR(get_logger(), "stream expired: %s", e.what());
         stream_enabled_ = false;
-        // Cancel and release the expired stream before any reconnect attempt
         if (stream_) { stream_->Cancel(); stream_.reset(); }
         ctrl_jp_.enabled = ctrl_jip_.enabled = false;
       }
@@ -435,7 +425,6 @@ class Rby1RtNode : public rclcpp::Node {
   void on_state(const RobotState<A>& rs, const ControlManagerState& cms) {
     { std::lock_guard<std::mutex> lk(state_mtx_); cached_state_ = std::make_shared<RobotState<A>>(rs); }
 
-    // /rby1_status_joint
     sensor_msgs::msg::JointState jmsg;
     jmsg.header.stamp = get_clock()->now();
     for (double v : rs.position) jmsg.position.push_back(v);
@@ -443,8 +432,6 @@ class Rby1RtNode : public rclcpp::Node {
     for (double v : rs.torque)   jmsg.effort.push_back(v);
     pub_joints_->publish(jmsg);
 
-    // /rby1_status — JSON matching small_main.py parse keys
-    // Uses cached atomic flags — no gRPC calls in this hot path
     std::string ctrl_str;
     switch (cms.state) {
       case ControlManagerState::State::kEnabled:    ctrl_str = "State.Enabled";    break;
@@ -457,12 +444,12 @@ class Rby1RtNode : public rclcpp::Node {
 
     std::ostringstream json;
     json << "{"
-         << "\"control_state\":\"" << ctrl_str                          << "\","
-         << "\"power_state\":\""   << (power_on_.load()  ? "True":"False") << "\","
-         << "\"servo_state\":\""   << (servo_on_.load()  ? "True":"False") << "\","
+         << "\"control_state\":\"" << ctrl_str                              << "\","
+         << "\"power_state\":\""   << (power_on_.load()    ? "True":"False") << "\","
+         << "\"servo_state\":\""   << (servo_on_.load()    ? "True":"False") << "\","
          << "\"stream_state\":\""  << (stream_enabled_.load() ? "True":"False") << "\","
-         << "\"gripper_state\":\"" << (no_gripper_.load() ? "True":"False") << "\","
-         << "\"ctr_type\":\""      << ctr_snap                         << "\""
+         << "\"gripper_state\":\"" << (no_gripper_.load()  ? "True":"False") << "\","
+         << "\"ctr_type\":\""      << ctr_snap                             << "\""
          << "}";
     std_msgs::msg::String smsg;
     smsg.data = json.str();
@@ -490,12 +477,12 @@ class Rby1RtNode : public rclcpp::Node {
     else if (parts[0] == "stream_stop")            ok = cmd_stream_stop();
     else if (parts[0] == "teleop_start")           ok = cmd_teleop_start();
     else if (parts[0] == "impedance_teleop_start") ok = cmd_impedance_teleop_start();
-    else if (parts[0] == "teleop_pink_start")      ok = cmd_teleop_start();  // fallback: no IK in C++ yet
+    else if (parts[0] == "teleop_pink_start")      ok = cmd_teleop_start();
     else if (parts[0] == "teleop_stop")            ok = cmd_teleop_stop();
-    else if (parts[0] == "zero_pose")              ok = cmd_send_pose(build_zero_pose());
-    else if (parts[0] == "ready_pose")             ok = cmd_send_pose(build_ready_pose());
-    else if (parts[0] == "vla_pose")               ok = cmd_send_pose(build_vla_pose());
-    else if (parts[0] == "vla_pose2")              ok = cmd_send_pose(build_vla_pose2());
+    else if (parts[0] == "zero_pose")              ok = cmd_pose(Eigen::VectorXd::Zero(kNumBody));
+    else if (parts[0] == "ready_pose")             ok = cmd_pose(build_ready_q());
+    else if (parts[0] == "vla_pose")               ok = cmd_pose(build_vla_q());
+    else if (parts[0] == "vla_pose2")              ok = cmd_pose(build_vla2_q());
     else if (parts[0] == "clean_test")             ok = cmd_clean_test();
     else RCLCPP_WARN(get_logger(), "Unknown command: %s", cmd.c_str());
 
@@ -528,8 +515,7 @@ class Rby1RtNode : public rclcpp::Node {
   }
   bool cmd_power_off() {
     if (!check() || !robot_->PowerOff(".*")) return false;
-    power_on_ = false;
-    servo_on_ = false;
+    power_on_ = false; servo_on_ = false;
     return true;
   }
   bool cmd_servo_on() {
@@ -547,7 +533,7 @@ class Rby1RtNode : public rclcpp::Node {
   }
   bool cmd_gripper_init() {
     if (no_gripper_.load()) return true;
-    RCLCPP_WARN(get_logger(), "gripper_init: gripper driver not yet implemented in C++ node");
+    RCLCPP_WARN(get_logger(), "gripper_init: not implemented in C++ node");
     return false;
   }
   bool cmd_control_enable() {
@@ -566,8 +552,8 @@ class Rby1RtNode : public rclcpp::Node {
   bool stop_move() {
     if (!check()) return false;
     cmd_stream_stop();
-    auto rc = RobotCommandBuilder().SetCommand(
-        WholeBodyCommandBuilder().SetCommand(StopCommandBuilder()));
+    RobotCommandBuilder rc;
+    rc.SetCommand(WholeBodyCommandBuilder().SetCommand(StopCommandBuilder()));
     return robot_->SendCommand(rc, 99)->Get().finish_code() == RobotCommandFeedback::FinishCode::kOk;
   }
   bool cmd_stream_start(const std::string& type) {
@@ -604,54 +590,52 @@ class Rby1RtNode : public rclcpp::Node {
     ctrl_jp_.enabled = ctrl_jip_.enabled = false;
     return cmd_stream_stop();
   }
-  bool cmd_send_pose(RobotCommandBuilder rc) {
+  bool cmd_pose(const Eigen::VectorXd& q, double t = 5.) {
     if (!check() || !robot_ok_) return false;
     cmd_stream_stop();
+    JointPositionCommandBuilder bc;
+    bc.SetPosition(q).SetMinimumTime(t);
+    ComponentBasedCommandBuilder cbc;
+    cbc.SetBodyCommand(bc);
+    RobotCommandBuilder rc;
+    rc.SetCommand(cbc);
     return robot_->SendCommand(rc, 20)->Get().finish_code() == RobotCommandFeedback::FinishCode::kOk;
   }
   bool cmd_clean_test() {
     if (!check() || !robot_ok_) return false;
-    cmd_send_pose(build_zero_pose());
+    cmd_pose(Eigen::VectorXd::Zero(kNumBody));
     std::this_thread::sleep_for(std::chrono::seconds(2));
-    cmd_send_pose(build_vla_pose());
+    cmd_pose(build_vla_q());
     std::this_thread::sleep_for(std::chrono::seconds(2));
-    cmd_send_pose(build_ready_pose());
+    cmd_pose(build_ready_q());
     std::this_thread::sleep_for(std::chrono::seconds(2));
-    cmd_send_pose(build_zero_pose());
+    cmd_pose(Eigen::VectorXd::Zero(kNumBody));
     return true;
   }
 
-  // ── Pose builders ────────────────────────────────────────────────────────
-  static RobotCommandBuilder make_pose_cmd(const Eigen::VectorXd& q, double t = 5.) {
-    return RobotCommandBuilder().SetCommand(
-        ComponentBasedCommandBuilder().SetBodyCommand(
-            JointPositionCommandBuilder().SetPosition(q).SetMinimumTime(t)));
-  }
-  static RobotCommandBuilder build_zero_pose() {
-    return make_pose_cmd(Eigen::VectorXd::Zero(kNumBody));
-  }
-  static RobotCommandBuilder build_ready_pose() {
-    Eigen::Vector<double, 6> torso; torso << 0, 30, -60, 30, 0, 0;
-    Eigen::Vector<double, 7> ra;    ra    << -8.68, -9.86,  1.89, -103.95,  0.37, 22.07, -10.35;
-    Eigen::Vector<double, 7> la;    la    << -8.68,  9.86, -1.89, -103.95, -0.37, 22.07,  10.35;
+  // ── Joint angle presets ───────────────────────────────────────────────────
+  static Eigen::VectorXd build_ready_q() {
+    Eigen::Vector<double,6> torso; torso << 0, 30, -60, 30, 0, 0;
+    Eigen::Vector<double,7> ra;    ra    << -8.68, -9.86,  1.89, -103.95,  0.37, 22.07, -10.35;
+    Eigen::Vector<double,7> la;    la    << -8.68,  9.86, -1.89, -103.95, -0.37, 22.07,  10.35;
     Eigen::VectorXd q(kNumBody);
     q << torso*(M_PI/180.), ra*(M_PI/180.), la*(M_PI/180.);
-    return make_pose_cmd(q);
+    return q;
   }
-  static RobotCommandBuilder build_vla_pose() {
-    Eigen::Vector<double, 6> torso; torso << 0.0, -0.223,  0.497, 0.0263, 0., 0.;
-    Eigen::Vector<double, 7> ra;    ra    << -1.80, -1.16,  1.30, -1.32, -1.47, 1.08,  2.3;
-    Eigen::Vector<double, 7> la;    la    << -1.80,  1.16, -1.30, -1.32,  1.47, 1.08, -2.3;
+  static Eigen::VectorXd build_vla_q() {
+    Eigen::Vector<double,6> torso; torso << 0.0, -0.223,  0.497, 0.0263, 0., 0.;
+    Eigen::Vector<double,7> ra;    ra    << -1.80, -1.16,  1.30, -1.32, -1.47, 1.08,  2.3;
+    Eigen::Vector<double,7> la;    la    << -1.80,  1.16, -1.30, -1.32,  1.47, 1.08, -2.3;
     Eigen::VectorXd q(kNumBody); q << torso, ra, la;
-    return make_pose_cmd(q);
+    return q;
   }
-  static RobotCommandBuilder build_vla_pose2() {
+  static Eigen::VectorXd build_vla2_q() {
     constexpr double adj = 0.3, wrist = M_PI/2.;
-    Eigen::Vector<double, 6> torso; torso << 0.0, -0.223+adj,  0.497, 0.0263+adj, 0., 0.;
-    Eigen::Vector<double, 7> ra;    ra    << -1.80-adj, -1.16-adj*0.5,  1.30, -1.32, -1.47, 1.08,  2.3-wrist;
-    Eigen::Vector<double, 7> la;    la    << -1.80-adj,  1.16+adj*0.5, -1.30, -1.32,  1.47, 1.08, -2.3+wrist;
+    Eigen::Vector<double,6> torso; torso << 0.0, -0.223+adj,  0.497, 0.0263+adj, 0., 0.;
+    Eigen::Vector<double,7> ra;    ra    << -1.80-adj, -1.16-adj*0.5,  1.30, -1.32, -1.47, 1.08,  2.3-wrist;
+    Eigen::Vector<double,7> la;    la    << -1.80-adj,  1.16+adj*0.5, -1.30, -1.32,  1.47, 1.08, -2.3+wrist;
     Eigen::VectorXd q(kNumBody); q << torso, ra, la;
-    return make_pose_cmd(q);
+    return q;
   }
 };
 
