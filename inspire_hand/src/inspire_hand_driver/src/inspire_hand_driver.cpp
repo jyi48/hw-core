@@ -4,6 +4,7 @@
 using namespace std::chrono_literals;
 using CtrlMsg  = inspire_hand_msgs::msg::InspireHandCtrl;
 using StateMsg = inspire_hand_msgs::msg::InspireHandState;
+// using TouchMsg = inspire_hand_msgs::msg::InspireHandTouch;  // touch 활성화 시 해제
 
 namespace inspire_hand_driver
 {
@@ -72,6 +73,10 @@ void InspireHandDriver::init_hand(Hand & hand)
 
   hand.state_pub = this->create_publisher<StateMsg>(state_topic, rclcpp::QoS(1));
 
+  // touch publisher — 활성화 시 아래 주석 해제 + 헤더/using/do_touch_read_publish 함께 해제
+  // std::string touch_topic = "/rt/inspire_hand/touch/" + hand.config.side;
+  // hand.touch_pub = this->create_publisher<TouchMsg>(touch_topic, rclcpp::QoS(1));
+
   RCLCPP_INFO(get_logger(), "[%s] sub:%s", hand.config.side.c_str(), ctrl_topic.c_str());
 }
 
@@ -95,6 +100,9 @@ void InspireHandDriver::tick(Hand & hand)
 
   // 2. state read + publish
   do_read_publish(hand);
+
+  // 3. touch read + publish (활성화 시 주석 해제)
+  // do_touch_read_publish(hand);
 }
 
 bool InspireHandDriver::ensure_connected(Hand & hand)
@@ -166,5 +174,37 @@ void InspireHandDriver::do_read_publish(Hand & hand)
       "[%s] read failed: %s", hand.config.side.c_str(), e.what());
   }
 }
+
+// ── touch read + publish — 활성화 시 주석 전체 해제 ──────────
+// void InspireHandDriver::do_touch_read_publish(Hand & hand)
+// {
+//   try {
+//     TouchMsg msg;
+//     auto read_s = [&](int addr, int n) {
+//       return hand.modbus->read_registers_short(addr, n);
+//     };
+//     auto r = read_s(reg::TOUCH_FINGERONE_TIP,    18); std::copy(r.begin(), r.end(), msg.fingerone_tip_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERONE_TOP,    192); std::copy(r.begin(), r.end(), msg.fingerone_top_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERONE_PALM,   160); std::copy(r.begin(), r.end(), msg.fingerone_palm_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERTWO_TIP,     18); std::copy(r.begin(), r.end(), msg.fingertwo_tip_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERTWO_TOP,    192); std::copy(r.begin(), r.end(), msg.fingertwo_top_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERTWO_PALM,   160); std::copy(r.begin(), r.end(), msg.fingertwo_palm_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERTHREE_TIP,   18); std::copy(r.begin(), r.end(), msg.fingerthree_tip_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERTHREE_TOP,  192); std::copy(r.begin(), r.end(), msg.fingerthree_top_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERTHREE_PALM, 160); std::copy(r.begin(), r.end(), msg.fingerthree_palm_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERFOUR_TIP,    18); std::copy(r.begin(), r.end(), msg.fingerfour_tip_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERFOUR_TOP,   192); std::copy(r.begin(), r.end(), msg.fingerfour_top_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERFOUR_PALM,  160); std::copy(r.begin(), r.end(), msg.fingerfour_palm_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERFIVE_TIP,    18); std::copy(r.begin(), r.end(), msg.fingerfive_tip_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERFIVE_TOP,   192); std::copy(r.begin(), r.end(), msg.fingerfive_top_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERFIVE_MIDDLE, 18); std::copy(r.begin(), r.end(), msg.fingerfive_middle_touch.begin());
+//     r = read_s(reg::TOUCH_FINGERFIVE_PALM,  192); std::copy(r.begin(), r.end(), msg.fingerfive_palm_touch.begin());
+//     r = read_s(reg::TOUCH_PALM,             224); std::copy(r.begin(), r.end(), msg.palm_touch.begin());
+//     hand.touch_pub->publish(msg);
+//   } catch (const std::exception & e) {
+//     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+//       "[%s] touch read failed: %s", hand.config.side.c_str(), e.what());
+//   }
+// }
 
 }  // namespace inspire_hand_driver
