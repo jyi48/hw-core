@@ -417,6 +417,19 @@ class Rby1RtNode : public rclcpp::Node {
         continue;
       }
 
+      if (stream_ && stream_->IsDone()) {
+        RCLCPP_ERROR(get_logger(), "stream died before SendCommand (OnDone fired late)");
+        stream_enabled_ = false;
+        stream_->Cancel(); stream_.reset();
+        ctrl_jp_.enabled = ctrl_jip_.enabled = false;
+        if (robot_) {
+          auto cms2 = robot_->GetControlManagerState();
+          RCLCPP_ERROR(get_logger(), "cms after stream death: %s",
+                       rb::to_string(cms2.state).c_str());
+        }
+        sleep_until_abs(next, dt_ns);
+        continue;
+      }
       try {
         if (stream_) stream_->SendCommand(rc);
       } catch (const std::exception& e) {
@@ -424,6 +437,11 @@ class Rby1RtNode : public rclcpp::Node {
         stream_enabled_ = false;
         if (stream_) { stream_->Cancel(); stream_.reset(); }
         ctrl_jp_.enabled = ctrl_jip_.enabled = false;
+        if (robot_) {
+          auto cms2 = robot_->GetControlManagerState();
+          RCLCPP_ERROR(get_logger(), "cms after stream expired: %s",
+                       rb::to_string(cms2.state).c_str());
+        }
       }
       sleep_until_abs(next, dt_ns);
     }
@@ -569,6 +587,30 @@ class Rby1RtNode : public rclcpp::Node {
     auto cms = robot_->GetControlManagerState();
     if (cms.state != ControlManagerState::State::kEnabled) return false;
     stream_ = robot_->CreateCommandStream();
+    // 현재 상태로 hold command를 즉시 전송 — Python example 17 방식
+    // stream 생성 직후 첫 command를 즉시 보내야 서버가 stream을 유지함
+    try {
+      auto rs = robot_->GetState();
+      Eigen::VectorXd qh(kNumBody);
+      for (int i = 0; i < kNumBody; ++i) qh[i] = rs.position[kNumWheel + i];
+      MobilityCommandBuilder mc;
+      mc.SetCommand(SE2VelocityCommandBuilder()
+          .SetVelocity(Eigen::Vector2d::Zero(), 0.)
+          .SetMinimumTime(kStreamDt * 5)
+          .SetAccelerationLimit(Eigen::Vector2d::Constant(10.), 10.));
+      JointPositionCommandBuilder hold;
+      hold.SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt * 30))
+          .SetPosition(qh).SetMinimumTime(kStreamDt * 10);
+      ComponentBasedCommandBuilder cbc;
+      cbc.SetBodyCommand(hold).SetMobilityCommand(mc);
+      RobotCommandBuilder rc;
+      rc.SetCommand(cbc);
+      stream_->SendCommand(rc);
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(get_logger(), "cmd_stream_start: initial command failed: %s", e.what());
+      stream_.reset();
+      return false;
+    }
     { std::lock_guard<std::mutex> lk(ctr_type_mtx_); ctr_type_ = type; }
     stream_enabled_ = true;
     return true;
