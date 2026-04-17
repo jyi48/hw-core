@@ -55,7 +55,7 @@ using namespace rb::y1_model;
 using DynRobot = dyn::Robot<ModelType::kRobotDOF>;
 using DynState = dyn::State<ModelType::kRobotDOF>;
 
-static constexpr double kStreamDt   = 0.02;   // 50 Hz
+static constexpr double kStreamDt   = 0.01;   // 100 Hz
 static constexpr int    kNumBody    = 20;      // 6 torso + 7 rarm + 7 larm
 static constexpr double kStopWheelT = 0.5;
 
@@ -615,7 +615,7 @@ class Rby1RtNode : public rclcpp::Node {
     dyn_state_ = dyn_->MakeState({"base","ee_right","ee_left","link_torso_5"}, ModelType::kRobotJointNames);
     robot_->StartStateUpdate(
         [this](const RobotState<ModelType>& rs, const ControlManagerState& cms){ on_state(rs, cms); },
-        50.0);
+        100.0);
     RCLCPP_INFO(get_logger(), "Connected to %s%s", parts[1].c_str(), no_gripper_.load() ? " (no_gripper)" : "");
     return true;
   }
