@@ -329,7 +329,6 @@ class Rby1RtNode : public rclcpp::Node {
   std::string ctr_type_{"JointPosition"};
   std::mutex  ctr_type_mtx_;
   std::mutex  command_mtx_;
-  std::chrono::steady_clock::time_point last_blocking_command_done_at_{std::chrono::steady_clock::now()};
 
   JointTeleopController          ctrl_jp_;
   JointImpedanceTeleopController ctrl_jip_;
@@ -670,7 +669,6 @@ class Rby1RtNode : public rclcpp::Node {
     rc.SetCommand(WholeBodyCommandBuilder().SetCommand(StopCommandBuilder()));
     const bool ok =
         robot_->SendCommand(rc, 99)->Get().finish_code() == RobotCommandFeedback::FinishCode::kOk;
-    if (ok) last_blocking_command_done_at_ = std::chrono::steady_clock::now();
     return ok;
   }
   bool cmd_stream_start(const std::string& type) {
@@ -685,21 +683,6 @@ class Rby1RtNode : public rclcpp::Node {
       return false;
     }
     if (cs != ControlManagerState::State::kEnabled) return false;
-    const auto since_blocking_done =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - last_blocking_command_done_at_);
-    if (since_blocking_done < std::chrono::milliseconds(1200)) {
-      const auto wait_ms = std::chrono::milliseconds(1200) - since_blocking_done;
-      RCLCPP_INFO(get_logger(),
-                  "cmd_stream_start: cooling down for %lld ms after blocking command",
-                  static_cast<long long>(wait_ms.count()));
-      std::this_thread::sleep_for(wait_ms);
-    }
-    if (!wait_for_stream_start_window()) {
-      RCLCPP_ERROR(get_logger(), "cmd_stream_start: robot/control manager not settled for stream start");
-      return false;
-    }
-
     stream_ = robot_->CreateCommandStream();
     if (stream_->IsDone()) {
       RCLCPP_ERROR(get_logger(), "stream already closed at creation: cms=%s",
@@ -748,7 +731,6 @@ class Rby1RtNode : public rclcpp::Node {
     rc.SetCommand(cbc);
     const bool ok =
         robot_->SendCommand(rc, 20)->Get().finish_code() == RobotCommandFeedback::FinishCode::kOk;
-    if (ok) last_blocking_command_done_at_ = std::chrono::steady_clock::now();
     return ok;
   }
   bool cmd_clean_test() {
