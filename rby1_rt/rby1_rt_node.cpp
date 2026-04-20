@@ -543,13 +543,17 @@ class Rby1RtNode : public rclcpp::Node {
           const Eigen::VectorXd q_ns_l  = q_ready.segment(13, 7);
           Eigen::VectorXd ns_w = Eigen::VectorXd::Ones(7);
           ns_w[1] = 5.0;  // shoulder roll — self-collision bias
+          const Eigen::Vector<double,7> K_imp  = (Eigen::Vector<double,7>() << 80,80,80,80,80,80,40).finished();
+          const Eigen::Vector<double,7> tq_imp = (Eigen::Vector<double,7>() << 35,35,35,20,20,20,15).finished();
           bc.SetRightArmCommand(CartesianImpedanceControlCommandBuilder()
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
               .AddTarget("base", "ee_right", T_r, 0.5, 3.0)
+              .SetJointStiffness(K_imp).SetJointDampingRatio(1.0).SetJointTorqueLimit(tq_imp)
               .SetNullspaceJointTarget(q_ns_r, ns_w))
             .SetLeftArmCommand(CartesianImpedanceControlCommandBuilder()
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
               .AddTarget("base", "ee_left", T_l, 0.5, 3.0)
+              .SetJointStiffness(K_imp).SetJointDampingRatio(1.0).SetJointTorqueLimit(tq_imp)
               .SetNullspaceJointTarget(q_ns_l, ns_w));
         }
         ComponentBasedCommandBuilder cbc;
@@ -823,9 +827,26 @@ class Rby1RtNode : public rclcpp::Node {
       cleanup_stream("faulted before stream start");
       return false;
     }
-    if (cs != ControlManagerState::State::kEnabled) return false;
+    // stream cancel 후 CM이 Idle로 떨어지는 경우 자동 re-enable
+    if (cs != ControlManagerState::State::kEnabled) {
+      RCLCPP_INFO(get_logger(), "cmd_stream_start: CM is %s — re-enabling",
+                  rb::to_string(cs).c_str());
+      needs_stop_.store(false);  // EnableControlManager가 CM 상태를 초기화
+      if (!robot_->EnableControlManager()) {
+        RCLCPP_ERROR(get_logger(), "cmd_stream_start: EnableControlManager failed");
+        return false;
+      }
+      for (int i = 0; i < 50; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        if (cms_state() == ControlManagerState::State::kEnabled) break;
+      }
+      if (cms_state() != ControlManagerState::State::kEnabled) {
+        RCLCPP_ERROR(get_logger(), "cmd_stream_start: CM did not become enabled");
+        return false;
+      }
+    }
 
-    // stream 비정상 종료 후 CM을 안정 상태로 되돌리기 위해 StopCommand 전송
+    // Enabled지만 이전 stream이 비정상 종료된 경우 StopCommand로 flush
     if (needs_stop_.exchange(false)) {
       RCLCPP_INFO(get_logger(), "cmd_stream_start: sending StopCommand after stream death");
       RobotCommandBuilder rc;
