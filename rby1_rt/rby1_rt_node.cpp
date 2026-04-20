@@ -490,23 +490,34 @@ class Rby1RtNode : public rclcpp::Node {
             qh[i] = (tp_norm > 1e-6) ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
           Eigen::Map<Eigen::VectorXd> ra(qh.data()+6, 7);
           Eigen::Map<Eigen::VectorXd> la(qh.data()+13, 7);
+          Eigen::Map<Eigen::VectorXd> to(qh.data(), 6);
           bc.SetRightArmCommand(JointPositionCommandBuilder()
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
               .SetPosition(ra).SetMinimumTime(0.2))
             .SetLeftArmCommand(JointPositionCommandBuilder()
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
-              .SetPosition(la).SetMinimumTime(0.2));
+              .SetPosition(la).SetMinimumTime(0.2))
+            .SetTorsoCommand(JointPositionCommandBuilder()
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
+              .SetPosition(to).SetMinimumTime(0.2));
         } else {
           if (has_new) ctrl_sdk_.traj_dt_cnt++;
           double hold_t = has_new ? kStreamDt*30 : 3.0;
           double vel_l  = has_new ? 0.5 : 0.05;
           double vel_a  = has_new ? 3.0 : 0.5;
+          Eigen::VectorXd qt(6);
+          for (int i = 0; i < 6; ++i)
+            qt[i] = (rs->target_position[kNumWheel+i] > 1e-9 || rs->target_position[kNumWheel+i] < -1e-9)
+                    ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
           bc.SetRightArmCommand(CartesianCommandBuilder()
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(hold_t))
               .AddTarget("base", "ee_right", T_r, vel_l, vel_a))
             .SetLeftArmCommand(CartesianCommandBuilder()
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(hold_t))
-              .AddTarget("base", "ee_left", T_l, vel_l, vel_a));
+              .AddTarget("base", "ee_left", T_l, vel_l, vel_a))
+            .SetTorsoCommand(JointPositionCommandBuilder()
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(hold_t))
+              .SetPosition(qt).SetMinimumTime(kStreamDt*2));
         }
         ComponentBasedCommandBuilder cbc;
         cbc.SetBodyCommand(bc).SetMobilityCommand(mc);
@@ -529,38 +540,50 @@ class Rby1RtNode : public rclcpp::Node {
             tp_norm += rs->target_position[kNumWheel+i] * rs->target_position[kNumWheel+i];
           for (int i = 0; i < kNumBody; ++i)
             qh[i] = (tp_norm > 1e-6) ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
-          Eigen::Map<Eigen::VectorXd> ra(qh.data()+6, 7);
+          Eigen::Map<Eigen::VectorXd> ra(qh.data()+6,  7);
           Eigen::Map<Eigen::VectorXd> la(qh.data()+13, 7);
+          Eigen::Map<Eigen::VectorXd> to(qh.data(),    6);
           bc.SetRightArmCommand(JointPositionCommandBuilder()
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
               .SetPosition(ra).SetMinimumTime(0.2))
             .SetLeftArmCommand(JointPositionCommandBuilder()
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
-              .SetPosition(la).SetMinimumTime(0.2));
+              .SetPosition(la).SetMinimumTime(0.2))
+            .SetTorsoCommand(JointPositionCommandBuilder()
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
+              .SetPosition(to).SetMinimumTime(0.2));
         } else {
-          bool is_first_cmd = (ctrl_sdk_.traj_dt_cnt == 0);
           if (has_new) {
-            if (is_first_cmd) {
+            if (ctrl_sdk_.traj_dt_cnt == 0) {
               RCLCPP_INFO(get_logger(),
                 "CartesianImpedance first cmd: T_r=[%.3f,%.3f,%.3f] T_l=[%.3f,%.3f,%.3f]",
                 T_r(0,3), T_r(1,3), T_r(2,3), T_l(0,3), T_l(1,3), T_l(2,3));
             }
             ctrl_sdk_.traj_dt_cnt++;
           }
-          const Eigen::Vector<double,7> K_imp  = (Eigen::Vector<double,7>() << 80,80,80,80,80,80,40).finished();
-          const Eigen::Vector<double,7> tq_imp = (Eigen::Vector<double,7>() << 35,35,35,20,20,20,15).finished();
-          bc.SetRightArmCommand(CartesianImpedanceControlCommandBuilder()
+          Eigen::VectorXd qt(6);
+          for (int i = 0; i < 6; ++i)
+            qt[i] = (rs->target_position[kNumWheel+i] > 1e-9 || rs->target_position[kNumWheel+i] < -1e-9)
+                    ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
+          bc.SetRightArmCommand(ImpedanceControlCommandBuilder()
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
-              .AddTarget("base", "ee_right", T_r, 0.5, 3.0)
-              .SetJointStiffness(K_imp).SetJointDampingRatio(1.0).SetJointTorqueLimit(tq_imp)
-              .SetStopPositionTrackingError(0.5).SetStopOrientationTrackingError(1.5)
-              .SetResetReference(is_first_cmd))
-            .SetLeftArmCommand(CartesianImpedanceControlCommandBuilder()
+              .SetReferenceLinkName("base")
+              .SetLinkName("ee_right")
+              .SetTransformation(T_r)
+              .SetTranslationWeight({800, 800, 800})
+              .SetRotationWeight({30, 30, 30})
+              .SetDampingRatio(1.0))
+            .SetLeftArmCommand(ImpedanceControlCommandBuilder()
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
-              .AddTarget("base", "ee_left", T_l, 0.5, 3.0)
-              .SetJointStiffness(K_imp).SetJointDampingRatio(1.0).SetJointTorqueLimit(tq_imp)
-              .SetStopPositionTrackingError(0.5).SetStopOrientationTrackingError(1.5)
-              .SetResetReference(is_first_cmd));
+              .SetReferenceLinkName("base")
+              .SetLinkName("ee_left")
+              .SetTransformation(T_l)
+              .SetTranslationWeight({800, 800, 800})
+              .SetRotationWeight({30, 30, 30})
+              .SetDampingRatio(1.0))
+            .SetTorsoCommand(JointPositionCommandBuilder()
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
+              .SetPosition(qt).SetMinimumTime(kStreamDt*2));
         }
         ComponentBasedCommandBuilder cbc;
         cbc.SetBodyCommand(bc).SetMobilityCommand(mc);
