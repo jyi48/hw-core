@@ -296,7 +296,7 @@ class Rby1RtNode : public rclcpp::Node {
   using Rby1Command   = rby1_core_msgs::action::Rby1Command;
   using GoalHandleCmd = rclcpp_action::ServerGoalHandle<Rby1Command>;
 
-  Rby1RtNode() : Node("rby1_core_node") {
+  Rby1RtNode() : Node("rby1_rt_node") {
     sub_base_vel_ = create_subscription<geometry_msgs::msg::Twist>(
         "/rby1_base_velocity", 2,
         [this](const geometry_msgs::msg::Twist::SharedPtr m) {
