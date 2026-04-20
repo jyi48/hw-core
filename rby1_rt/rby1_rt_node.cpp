@@ -313,6 +313,7 @@ class Rby1RtNode : public rclcpp::Node {
         [this](const geometry_msgs::msg::PoseArray::SharedPtr m) {
           if (m->poses.size() < 2) return;
           std::lock_guard<std::mutex> lk(ctrl_sdk_.mtx);
+          if (!ctrl_sdk_.enabled) return;
           ctrl_sdk_.T_right = pose_to_matrix(m->poses[0]);
           ctrl_sdk_.T_left  = pose_to_matrix(m->poses[1]);
           ctrl_sdk_.new_cmd = true;
@@ -566,23 +567,23 @@ class Rby1RtNode : public rclcpp::Node {
             qt[i] = (rs->target_position[kNumWheel+i] > 1e-9 || rs->target_position[kNumWheel+i] < -1e-9)
                     ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
           bc.SetRightArmCommand(ImpedanceControlCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(1.0))
               .SetReferenceLinkName("base")
               .SetLinkName("ee_right")
               .SetTransformation(T_r)
-              .SetTranslationWeight({800, 800, 800})
-              .SetRotationWeight({30, 30, 30})
+              .SetTranslationWeight({3000, 3000, 3000})
+              .SetRotationWeight({50, 50, 50})
               .SetDampingRatio(1.0))
             .SetLeftArmCommand(ImpedanceControlCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(1.0))
               .SetReferenceLinkName("base")
               .SetLinkName("ee_left")
               .SetTransformation(T_l)
-              .SetTranslationWeight({800, 800, 800})
-              .SetRotationWeight({30, 30, 30})
+              .SetTranslationWeight({3000, 3000, 3000})
+              .SetRotationWeight({50, 50, 50})
               .SetDampingRatio(1.0))
             .SetTorsoCommand(JointPositionCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(1.0))
               .SetPosition(qt).SetMinimumTime(kStreamDt*2));
         }
         ComponentBasedCommandBuilder cbc;
