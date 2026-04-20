@@ -133,6 +133,7 @@ ros2 run rby1_rt rby1_rt_node
 |-------|------|-----------|
 | `/rby1_teleop_command` | `JointGroupCommand` | subscribe |
 | `/rby1_impedance_teleop_command` | `JointGroupCommand` | subscribe |
+| `/rby1_sdk_teleop_command` | `PoseArray` | subscribe |
 | `/rby1_base_velocity` | `Twist` | subscribe |
 | `/rby1_status` | `String` (JSON) | publish |
 | `/rby1_status_joint` | `JointState` | publish |
