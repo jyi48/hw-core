@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -357,7 +358,7 @@ class Rby1RtNode : public rclcpp::Node {
 
   std::string ctr_type_{"JointPosition"};
   std::mutex  ctr_type_mtx_;
-  std::mutex  command_mtx_;
+  std::timed_mutex command_mtx_;
 
   JointTeleopController          ctrl_jp_;
   JointImpedanceTeleopController ctrl_jip_;
@@ -644,9 +645,16 @@ class Rby1RtNode : public rclcpp::Node {
 
   // ── Command dispatch ─────────────────────────────────────────────────────
   void execute_command(const std::shared_ptr<GoalHandleCmd>& gh) {
-    std::lock_guard<std::mutex> cmd_lk(command_mtx_);
     auto result = std::make_shared<Rby1Command::Result>();
     const std::string& cmd = gh->get_goal()->command;
+    // 이전 커맨드가 블로킹 중이면 최대 10s 대기 후 포기 — 스레드 누적 방지
+    std::unique_lock<std::timed_mutex> cmd_lk(command_mtx_, std::defer_lock);
+    if (!cmd_lk.try_lock_for(std::chrono::seconds(10))) {
+      RCLCPP_ERROR(get_logger(), "Command '%s' timed out waiting for command_mtx_", cmd.c_str());
+      result->response = "command failed: mutex timeout";
+      gh->abort(result);
+      return;
+    }
     RCLCPP_INFO(get_logger(), "Command: %s", cmd.c_str());
     auto parts = split(cmd, '\n');
     bool ok = false;
@@ -822,7 +830,7 @@ class Rby1RtNode : public rclcpp::Node {
     RobotCommandBuilder rc;
     rc.SetCommand(WholeBodyCommandBuilder().SetCommand(StopCommandBuilder()));
     const bool ok =
-        robot_->SendCommand(rc, 99)->Get().finish_code() == RobotCommandFeedback::FinishCode::kOk;
+        robot_->SendCommand(rc, 10)->Get().finish_code() == RobotCommandFeedback::FinishCode::kOk;
     return ok;
   }
   bool cmd_stream_start(const std::string& type) {
@@ -841,8 +849,10 @@ class Rby1RtNode : public rclcpp::Node {
       RCLCPP_INFO(get_logger(), "cmd_stream_start: CM is %s — re-enabling",
                   rb::to_string(cs).c_str());
       needs_stop_.store(false);  // EnableControlManager가 CM 상태를 초기화
-      if (!robot_->EnableControlManager()) {
-        RCLCPP_ERROR(get_logger(), "cmd_stream_start: EnableControlManager failed");
+      // EnableControlManager는 timeout 파라미터 없음 — async로 3s 제한
+      auto f = std::async(std::launch::async, [this]{ return robot_->EnableControlManager(); });
+      if (f.wait_for(std::chrono::seconds(3)) != std::future_status::ready || !f.get()) {
+        RCLCPP_ERROR(get_logger(), "cmd_stream_start: EnableControlManager failed/timeout");
         return false;
       }
       for (int i = 0; i < 50; ++i) {
