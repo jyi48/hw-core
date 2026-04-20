@@ -503,19 +503,27 @@ class Rby1RtNode : public rclcpp::Node {
               .SetPosition(to).SetMinimumTime(0.2));
         } else {
           if (has_new) ctrl_sdk_.traj_dt_cnt++;
-          double hold_t = has_new ? kStreamDt*30 : 3.0;
-          double vel_l  = has_new ? 0.5 : 0.05;
-          double vel_a  = has_new ? 3.0 : 0.5;
+          double hold_t  = has_new ? kStreamDt*30 : 3.0;
+          double vel_l   = has_new ? 0.5 : 0.05;
+          double vel_a   = has_new ? 50.0 : 0.5;  // high angular limit to avoid orientation-lock
+          double q_ra2   = rs->position[kNumWheel + 8];   // right_arm_2 (elbow)
+          double q_la2   = rs->position[kNumWheel + 15];  // left_arm_2  (elbow)
           Eigen::VectorXd qt(6);
           for (int i = 0; i < 6; ++i)
             qt[i] = (rs->target_position[kNumWheel+i] > 1e-9 || rs->target_position[kNumWheel+i] < -1e-9)
                     ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
           bc.SetRightArmCommand(CartesianCommandBuilder()
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(hold_t))
-              .AddTarget("base", "ee_right", T_r, vel_l, vel_a))
+              .AddTarget("base", "ee_right", T_r, vel_l, vel_a)
+              .AddJointPositionTarget("right_arm_2", q_ra2)
+              .SetStopPositionTrackingError(0)
+              .SetStopOrientationTrackingError(0))
             .SetLeftArmCommand(CartesianCommandBuilder()
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(hold_t))
-              .AddTarget("base", "ee_left", T_l, vel_l, vel_a))
+              .AddTarget("base", "ee_left", T_l, vel_l, vel_a)
+              .AddJointPositionTarget("left_arm_2", q_la2)
+              .SetStopPositionTrackingError(0)
+              .SetStopOrientationTrackingError(0))
             .SetTorsoCommand(JointPositionCommandBuilder()
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(hold_t))
               .SetPosition(qt).SetMinimumTime(kStreamDt*2));
@@ -562,28 +570,36 @@ class Rby1RtNode : public rclcpp::Node {
             }
             ctrl_sdk_.traj_dt_cnt++;
           }
+          bool reset_ref = (ctrl_sdk_.traj_dt_cnt == 0);  // reset impedance ref on first cmd
+          Eigen::VectorXd K_arm(7);
+          K_arm << 80, 80, 80, 80, 80, 80, 40;  // joint stiffness (Nm/rad), last=wrist
+          Eigen::VectorXd tq_arm = Eigen::VectorXd::Constant(7, 30.0);  // torque limit (Nm)
           Eigen::VectorXd qt(6);
           for (int i = 0; i < 6; ++i)
             qt[i] = (rs->target_position[kNumWheel+i] > 1e-9 || rs->target_position[kNumWheel+i] < -1e-9)
                     ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
-          bc.SetRightArmCommand(ImpedanceControlCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(1.0))
-              .SetReferenceLinkName("base")
-              .SetLinkName("ee_right")
-              .SetTransformation(T_r)
-              .SetTranslationWeight({3000, 3000, 3000})
-              .SetRotationWeight({50, 50, 50})
-              .SetDampingRatio(1.0))
-            .SetLeftArmCommand(ImpedanceControlCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(1.0))
-              .SetReferenceLinkName("base")
-              .SetLinkName("ee_left")
-              .SetTransformation(T_l)
-              .SetTranslationWeight({3000, 3000, 3000})
-              .SetRotationWeight({50, 50, 50})
-              .SetDampingRatio(1.0))
+          bc.SetRightArmCommand(CartesianImpedanceControlCommandBuilder()
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*10))
+              .SetMinimumTime(kStreamDt * 1.01)
+              .AddTarget("base", "ee_right", T_r, 2.0, M_PI*2, 20.0, M_PI*80)
+              .SetJointStiffness(K_arm)
+              .SetJointTorqueLimit(tq_arm)
+              .SetStopPositionTrackingError(0)
+              .SetStopOrientationTrackingError(0)
+              .SetStopJointPositionTrackingError(0)
+              .SetResetReference(reset_ref))
+            .SetLeftArmCommand(CartesianImpedanceControlCommandBuilder()
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*10))
+              .SetMinimumTime(kStreamDt * 1.01)
+              .AddTarget("base", "ee_left", T_l, 2.0, M_PI*2, 20.0, M_PI*80)
+              .SetJointStiffness(K_arm)
+              .SetJointTorqueLimit(tq_arm)
+              .SetStopPositionTrackingError(0)
+              .SetStopOrientationTrackingError(0)
+              .SetStopJointPositionTrackingError(0)
+              .SetResetReference(reset_ref))
             .SetTorsoCommand(JointPositionCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(1.0))
+              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*10))
               .SetPosition(qt).SetMinimumTime(kStreamDt*2));
         }
         ComponentBasedCommandBuilder cbc;
