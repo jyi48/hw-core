@@ -353,6 +353,7 @@ class Rby1RtNode : public rclcpp::Node {
   std::atomic<bool> servo_on_{false};
   std::atomic<int>  cached_cms_state_{0};  // ControlManagerState::State (on_state 콜백에서 갱신)
   std::atomic<bool> self_collision_stop_{false};
+  std::atomic<bool> needs_stop_{false};  // stream 비정상 종료 후 StopCommand 필요
 
   std::string ctr_type_{"JointPosition"};
   std::mutex  ctr_type_mtx_;
@@ -680,6 +681,7 @@ class Rby1RtNode : public rclcpp::Node {
       stream_->Cancel();
       stream_.reset();
     }
+    needs_stop_ = true;
     ctrl_jp_.enabled  = false;
     ctrl_jip_.enabled = false;
     ctrl_sdk_.enabled = false;
@@ -822,6 +824,20 @@ class Rby1RtNode : public rclcpp::Node {
       return false;
     }
     if (cs != ControlManagerState::State::kEnabled) return false;
+
+    // stream 비정상 종료 후 CM을 안정 상태로 되돌리기 위해 StopCommand 전송
+    if (needs_stop_.exchange(false)) {
+      RCLCPP_INFO(get_logger(), "cmd_stream_start: sending StopCommand after stream death");
+      RobotCommandBuilder rc;
+      rc.SetCommand(WholeBodyCommandBuilder().SetCommand(StopCommandBuilder()));
+      robot_->SendCommand(rc, 10)->Get();
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    if (!wait_for_stream_start_window()) {
+      RCLCPP_WARN(get_logger(), "cmd_stream_start: proceeding despite window timeout");
+    }
+
     stream_ = robot_->CreateCommandStream();
     if (stream_->IsDone()) {
       RCLCPP_ERROR(get_logger(), "stream already closed at creation: cms=%s",
