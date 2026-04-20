@@ -538,19 +538,15 @@ class Rby1RtNode : public rclcpp::Node {
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
               .SetPosition(la).SetMinimumTime(0.2));
         } else {
+          bool is_first_cmd = (ctrl_sdk_.traj_dt_cnt == 0);
           if (has_new) {
-            if (ctrl_sdk_.traj_dt_cnt == 0) {
+            if (is_first_cmd) {
               RCLCPP_INFO(get_logger(),
                 "CartesianImpedance first cmd: T_r=[%.3f,%.3f,%.3f] T_l=[%.3f,%.3f,%.3f]",
                 T_r(0,3), T_r(1,3), T_r(2,3), T_l(0,3), T_l(1,3), T_l(2,3));
             }
             ctrl_sdk_.traj_dt_cnt++;
           }
-          const Eigen::VectorXd q_ready = build_ready_q();
-          const Eigen::VectorXd q_ns_r  = q_ready.segment(6, 7);
-          const Eigen::VectorXd q_ns_l  = q_ready.segment(13, 7);
-          Eigen::VectorXd ns_w = Eigen::VectorXd::Ones(7);
-          ns_w[1] = 5.0;  // shoulder roll — self-collision bias
           const Eigen::Vector<double,7> K_imp  = (Eigen::Vector<double,7>() << 80,80,80,80,80,80,40).finished();
           const Eigen::Vector<double,7> tq_imp = (Eigen::Vector<double,7>() << 35,35,35,20,20,20,15).finished();
           bc.SetRightArmCommand(CartesianImpedanceControlCommandBuilder()
@@ -558,13 +554,13 @@ class Rby1RtNode : public rclcpp::Node {
               .AddTarget("base", "ee_right", T_r, 0.5, 3.0)
               .SetJointStiffness(K_imp).SetJointDampingRatio(1.0).SetJointTorqueLimit(tq_imp)
               .SetStopPositionTrackingError(0.5).SetStopOrientationTrackingError(1.5)
-              .SetNullspaceJointTarget(q_ns_r, ns_w))
+              .SetResetReference(is_first_cmd))
             .SetLeftArmCommand(CartesianImpedanceControlCommandBuilder()
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
               .AddTarget("base", "ee_left", T_l, 0.5, 3.0)
               .SetJointStiffness(K_imp).SetJointDampingRatio(1.0).SetJointTorqueLimit(tq_imp)
               .SetStopPositionTrackingError(0.5).SetStopOrientationTrackingError(1.5)
-              .SetNullspaceJointTarget(q_ns_l, ns_w));
+              .SetResetReference(is_first_cmd));
         }
         ComponentBasedCommandBuilder cbc;
         cbc.SetBodyCommand(bc).SetMobilityCommand(mc);
