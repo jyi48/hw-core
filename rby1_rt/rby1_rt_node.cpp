@@ -537,7 +537,14 @@ class Rby1RtNode : public rclcpp::Node {
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
               .SetPosition(la).SetMinimumTime(0.2));
         } else {
-          if (has_new) ctrl_sdk_.traj_dt_cnt++;
+          if (has_new) {
+            if (ctrl_sdk_.traj_dt_cnt == 0) {
+              RCLCPP_INFO(get_logger(),
+                "CartesianImpedance first cmd: T_r=[%.3f,%.3f,%.3f] T_l=[%.3f,%.3f,%.3f]",
+                T_r(0,3), T_r(1,3), T_r(2,3), T_l(0,3), T_l(1,3), T_l(2,3));
+            }
+            ctrl_sdk_.traj_dt_cnt++;
+          }
           const Eigen::VectorXd q_ready = build_ready_q();
           const Eigen::VectorXd q_ns_r  = q_ready.segment(6, 7);
           const Eigen::VectorXd q_ns_l  = q_ready.segment(13, 7);
@@ -549,11 +556,13 @@ class Rby1RtNode : public rclcpp::Node {
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
               .AddTarget("base", "ee_right", T_r, 0.5, 3.0)
               .SetJointStiffness(K_imp).SetJointDampingRatio(1.0).SetJointTorqueLimit(tq_imp)
+              .SetStopPositionTrackingError(0.5).SetStopOrientationTrackingError(1.5)
               .SetNullspaceJointTarget(q_ns_r, ns_w))
             .SetLeftArmCommand(CartesianImpedanceControlCommandBuilder()
               .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*30))
               .AddTarget("base", "ee_left", T_l, 0.5, 3.0)
               .SetJointStiffness(K_imp).SetJointDampingRatio(1.0).SetJointTorqueLimit(tq_imp)
+              .SetStopPositionTrackingError(0.5).SetStopOrientationTrackingError(1.5)
               .SetNullspaceJointTarget(q_ns_l, ns_w));
         }
         ComponentBasedCommandBuilder cbc;
@@ -566,8 +575,8 @@ class Rby1RtNode : public rclcpp::Node {
       }
 
       if (stream_ && stream_->IsDone()) {
-        RCLCPP_ERROR(get_logger(), "stream died before SendCommand: cms=%s",
-                     rb::to_string(cms_state()).c_str());
+        RCLCPP_ERROR(get_logger(), "stream died before SendCommand: cms=%s ctr=%s sdk_cnt=%d",
+                     rb::to_string(cms_state()).c_str(), ctr.c_str(), ctrl_sdk_.traj_dt_cnt);
         cleanup_stream("stream died before SendCommand");
         sleep_until_abs(next, dt_ns);
         continue;
