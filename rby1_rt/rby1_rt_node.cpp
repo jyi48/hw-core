@@ -800,6 +800,12 @@ class Rby1RtNode : public rclcpp::Node {
     no_gripper_ = (parts.size() > 2 && parts[2] == "no_gripper");
     robot_ = Robot<ModelType>::Create(parts[1]);
     if (!robot_->Connect()) return false;
+    // Required by SDK — without cartesian_command.cutoff_frequency, Cartesian commands are silently filtered out
+    robot_->SetParameter("default.acceleration_limit_scaling", "0.8");
+    robot_->SetParameter("joint_position_command.cutoff_frequency", "5");
+    robot_->SetParameter("cartesian_command.cutoff_frequency", "5");
+    robot_->SetParameter("default.linear_acceleration_limit", "5");
+    std::this_thread::sleep_for(std::chrono::seconds(1));
     dyn_       = robot_->GetDynamics();
     dyn_state_ = dyn_->MakeState({"base","ee_right","ee_left","link_torso_5"}, ModelType::kRobotJointNames);
     robot_->StartStateUpdate(
