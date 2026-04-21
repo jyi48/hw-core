@@ -898,12 +898,17 @@ class Rby1RtNode : public rclcpp::Node {
       }
     }
 
-    // Enabled지만 이전 stream이 비정상 종료된 경우 StopCommand로 flush
-    if (needs_stop_.exchange(false)) {
-      RCLCPP_INFO(get_logger(), "cmd_stream_start: sending StopCommand after stream death");
+    // 이전 stream 비정상 종료 플래그가 있으면 추가 flush
+    needs_stop_.store(false);
+
+    // 항상 StopCommand로 CM 상태를 clean하게 만든 후 stream 생성
+    // ready_pose 같은 JointPosition SendCommand 완료 후 CM이 Cartesian streaming 준비가
+    // 안 된 상태에서 CreateCommandStream()을 호출하면 MinorFault가 발생하는 것을 방지
+    {
+      RCLCPP_INFO(get_logger(), "cmd_stream_start: flushing CM state before stream creation");
       RobotCommandBuilder rc;
       rc.SetCommand(WholeBodyCommandBuilder().SetCommand(StopCommandBuilder()));
-      robot_->SendCommand(rc, 10)->Get();
+      robot_->SendCommand(rc, 5)->Get();
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
