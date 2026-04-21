@@ -322,6 +322,9 @@ class Rby1RtNode : public rclcpp::Node {
 
     pub_status_ = create_publisher<std_msgs::msg::String>("/rby1_status", 2);
     pub_joints_ = create_publisher<sensor_msgs::msg::JointState>("/rby1_status_joint", 2);
+    // ── PoseArray → Joint Feedback Publisher ─────────────────────────────
+    pub_sdk_joints_ = create_publisher<sensor_msgs::msg::JointState>("/rby1_sdk_joint_state", 2);
+    // ─────────────────────────────────────────────────────────────────────
 
     action_server_ = rclcpp_action::create_server<Rby1Command>(
         this, "/rby1_command",
@@ -374,6 +377,7 @@ class Rby1RtNode : public rclcpp::Node {
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr sub_sdk_teleop_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_status_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_joints_;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_sdk_joints_;  // PoseArray → Joint Feedback
   rclcpp_action::Server<Rby1Command>::SharedPtr action_server_;
   std::thread stream_thread_;
 
@@ -624,7 +628,37 @@ class Rby1RtNode : public rclcpp::Node {
         continue;
       }
       try {
-        if (stream_) stream_->SendCommand(rc);
+        if (stream_) {
+          auto fb = stream_->SendCommand(rc);
+          // ── PoseArray → Joint Feedback Publisher ───────────────────────
+          // Capture IK-solved joint reference from CartesianImpedance feedback
+          // and publish for recording/monitoring. set_position() = firmware IK output (7-DOF per arm).
+          if (ctr == "CartesianImpedance") {
+            const auto& body_fb = fb.component_based_command()
+                                    .body_command()
+                                    .body_component_based_command();
+            const Eigen::VectorXd ra = body_fb.right_arm_command()
+                                              .cartesian_impedance_control_command()
+                                              .set_position();
+            const Eigen::VectorXd la = body_fb.left_arm_command()
+                                              .cartesian_impedance_control_command()
+                                              .set_position();
+            if (ra.size() == 7 && la.size() == 7) {
+              sensor_msgs::msg::JointState jmsg;
+              jmsg.header.stamp = get_clock()->now();
+              for (int i = 0; i < 7; ++i) {
+                jmsg.name.push_back("right_arm_" + std::to_string(i));
+                jmsg.position.push_back(ra[i]);
+              }
+              for (int i = 0; i < 7; ++i) {
+                jmsg.name.push_back("left_arm_" + std::to_string(i));
+                jmsg.position.push_back(la[i]);
+              }
+              pub_sdk_joints_->publish(jmsg);
+            }
+          }
+          // ───────────────────────────────────────────────────────────────
+        }
       } catch (const std::exception& e) {
         RCLCPP_ERROR(get_logger(), "stream SendCommand threw: %s | cms=%s",
                      e.what(), rb::to_string(cms_state()).c_str());
