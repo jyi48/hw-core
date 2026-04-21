@@ -282,6 +282,7 @@ struct CartesianTeleopController {
   bool enabled{false};
   bool new_cmd{false};
   int  traj_dt_cnt{0};
+  bool cartesian_initialized{false};  // true after FK init on first stream tick
   Eigen::Matrix4d T_right{Eigen::Matrix4d::Identity()};
   Eigen::Matrix4d T_left{Eigen::Matrix4d::Identity()};
   std::mutex mtx;
@@ -480,54 +481,48 @@ class Rby1RtNode : public rclcpp::Node {
           has_new = ctrl_sdk_.new_cmd;
           ctrl_sdk_.new_cmd = false;
         }
-        BodyComponentBasedCommandBuilder bc;
-        if (ctrl_sdk_.traj_dt_cnt == 0 && !has_new) {
-          // 첫 Cartesian 명령 오기 전: 현재 joint 위치 유지
-          Eigen::VectorXd qh(kNumBody);
-          double tp_norm = 0.;
-          for (int i = 0; i < kNumBody; ++i)
-            tp_norm += rs->target_position[kNumWheel+i] * rs->target_position[kNumWheel+i];
-          for (int i = 0; i < kNumBody; ++i)
-            qh[i] = (tp_norm > 1e-6) ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
-          Eigen::Map<Eigen::VectorXd> ra(qh.data()+6, 7);
-          Eigen::Map<Eigen::VectorXd> la(qh.data()+13, 7);
-          Eigen::Map<Eigen::VectorXd> to(qh.data(), 6);
-          bc.SetRightArmCommand(JointPositionCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
-              .SetPosition(ra).SetMinimumTime(0.2))
-            .SetLeftArmCommand(JointPositionCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
-              .SetPosition(la).SetMinimumTime(0.2))
-            .SetTorsoCommand(JointPositionCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
-              .SetPosition(to).SetMinimumTime(0.2));
-        } else {
-          if (has_new) ctrl_sdk_.traj_dt_cnt++;
-          double hold_t  = has_new ? kStreamDt*30 : 3.0;
-          double vel_l   = has_new ? 0.5 : 0.05;
-          double vel_a   = has_new ? 50.0 : 0.5;  // high angular limit to avoid orientation-lock
-          double q_ra2   = rs->position[kNumWheel + 8];   // right_arm_2 (elbow)
-          double q_la2   = rs->position[kNumWheel + 15];  // left_arm_2  (elbow)
-          Eigen::VectorXd qt(6);
-          for (int i = 0; i < 6; ++i)
-            qt[i] = (rs->target_position[kNumWheel+i] > 1e-9 || rs->target_position[kNumWheel+i] < -1e-9)
-                    ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
-          bc.SetRightArmCommand(CartesianCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(hold_t))
-              .AddTarget("base", "ee_right", T_r, vel_l, vel_a)
-              .AddJointPositionTarget("right_arm_2", q_ra2)
-              .SetStopPositionTrackingError(0)
-              .SetStopOrientationTrackingError(0))
-            .SetLeftArmCommand(CartesianCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(hold_t))
-              .AddTarget("base", "ee_left", T_l, vel_l, vel_a)
-              .AddJointPositionTarget("left_arm_2", q_la2)
-              .SetStopPositionTrackingError(0)
-              .SetStopOrientationTrackingError(0))
-            .SetTorsoCommand(JointPositionCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(hold_t))
-              .SetPosition(qt).SetMinimumTime(kStreamDt*2));
+        // First tick: seed T from FK so stream uses Cartesian from tick 0 (no mode switch)
+        if (!ctrl_sdk_.cartesian_initialized) {
+          dyn_state_->SetQ(Eigen::Map<const Eigen::VectorXd>(rs->position.data(), rs->position.size()));
+          dyn_->ComputeForwardKinematics(dyn_state_);
+          T_r = dyn_->ComputeTransformation(dyn_state_, 0, 1);
+          T_l = dyn_->ComputeTransformation(dyn_state_, 0, 2);
+          {
+            std::lock_guard<std::mutex> lk(ctrl_sdk_.mtx);
+            ctrl_sdk_.T_right = T_r;
+            ctrl_sdk_.T_left  = T_l;
+          }
+          ctrl_sdk_.cartesian_initialized = true;
+          RCLCPP_INFO(get_logger(),
+              "CartesianPosition init FK: T_r=[%.3f,%.3f,%.3f] T_l=[%.3f,%.3f,%.3f]",
+              T_r(0,3), T_r(1,3), T_r(2,3), T_l(0,3), T_l(1,3), T_l(2,3));
         }
+        if (has_new) ctrl_sdk_.traj_dt_cnt++;
+        double hold_t = has_new ? kStreamDt*30 : 3.0;
+        double vel_l  = has_new ? 0.5  : 0.05;
+        double vel_a  = has_new ? 50.0 : 0.5;
+        double q_ra2  = rs->position[kNumWheel + 8];   // right_arm_2 (elbow nullspace)
+        double q_la2  = rs->position[kNumWheel + 15];  // left_arm_2  (elbow nullspace)
+        Eigen::VectorXd qt(6);
+        for (int i = 0; i < 6; ++i)
+          qt[i] = (rs->target_position[kNumWheel+i] > 1e-9 || rs->target_position[kNumWheel+i] < -1e-9)
+                  ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
+        BodyComponentBasedCommandBuilder bc;
+        bc.SetRightArmCommand(CartesianCommandBuilder()
+            .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(hold_t))
+            .AddTarget("base", "ee_right", T_r, vel_l, vel_a)
+            .AddJointPositionTarget("right_arm_2", q_ra2)
+            .SetStopPositionTrackingError(0)
+            .SetStopOrientationTrackingError(0))
+          .SetLeftArmCommand(CartesianCommandBuilder()
+            .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(hold_t))
+            .AddTarget("base", "ee_left", T_l, vel_l, vel_a)
+            .AddJointPositionTarget("left_arm_2", q_la2)
+            .SetStopPositionTrackingError(0)
+            .SetStopOrientationTrackingError(0))
+          .SetTorsoCommand(JointPositionCommandBuilder()
+            .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(hold_t))
+            .SetPosition(qt).SetMinimumTime(kStreamDt*2));
         ComponentBasedCommandBuilder cbc;
         cbc.SetBodyCommand(bc).SetMobilityCommand(mc);
         rc.SetCommand(cbc);
@@ -541,67 +536,63 @@ class Rby1RtNode : public rclcpp::Node {
           has_new = ctrl_sdk_.new_cmd;
           ctrl_sdk_.new_cmd = false;
         }
-        BodyComponentBasedCommandBuilder bc;
-        if (ctrl_sdk_.traj_dt_cnt == 0 && !has_new) {
-          Eigen::VectorXd qh(kNumBody);
-          double tp_norm = 0.;
-          for (int i = 0; i < kNumBody; ++i)
-            tp_norm += rs->target_position[kNumWheel+i] * rs->target_position[kNumWheel+i];
-          for (int i = 0; i < kNumBody; ++i)
-            qh[i] = (tp_norm > 1e-6) ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
-          Eigen::Map<Eigen::VectorXd> ra(qh.data()+6,  7);
-          Eigen::Map<Eigen::VectorXd> la(qh.data()+13, 7);
-          Eigen::Map<Eigen::VectorXd> to(qh.data(),    6);
-          bc.SetRightArmCommand(JointPositionCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
-              .SetPosition(ra).SetMinimumTime(0.2))
-            .SetLeftArmCommand(JointPositionCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
-              .SetPosition(la).SetMinimumTime(0.2))
-            .SetTorsoCommand(JointPositionCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(3.0))
-              .SetPosition(to).SetMinimumTime(0.2));
-        } else {
-          if (has_new) {
-            if (ctrl_sdk_.traj_dt_cnt == 0) {
-              RCLCPP_INFO(get_logger(),
+        // First tick: seed T from FK so stream uses Cartesian from tick 0 (no mode switch)
+        if (!ctrl_sdk_.cartesian_initialized) {
+          dyn_state_->SetQ(Eigen::Map<const Eigen::VectorXd>(rs->position.data(), rs->position.size()));
+          dyn_->ComputeForwardKinematics(dyn_state_);
+          T_r = dyn_->ComputeTransformation(dyn_state_, 0, 1);
+          T_l = dyn_->ComputeTransformation(dyn_state_, 0, 2);
+          {
+            std::lock_guard<std::mutex> lk(ctrl_sdk_.mtx);
+            ctrl_sdk_.T_right = T_r;
+            ctrl_sdk_.T_left  = T_l;
+          }
+          ctrl_sdk_.cartesian_initialized = true;
+          RCLCPP_INFO(get_logger(),
+              "CartesianImpedance init FK: T_r=[%.3f,%.3f,%.3f] T_l=[%.3f,%.3f,%.3f]",
+              T_r(0,3), T_r(1,3), T_r(2,3), T_l(0,3), T_l(1,3), T_l(2,3));
+        }
+        // reset_ref=true on first real cmd so firmware snaps impedance ref to current state
+        bool reset_ref = (ctrl_sdk_.traj_dt_cnt == 0 && has_new);
+        if (has_new) {
+          if (ctrl_sdk_.traj_dt_cnt == 0) {
+            RCLCPP_INFO(get_logger(),
                 "CartesianImpedance first cmd: T_r=[%.3f,%.3f,%.3f] T_l=[%.3f,%.3f,%.3f]",
                 T_r(0,3), T_r(1,3), T_r(2,3), T_l(0,3), T_l(1,3), T_l(2,3));
-            }
-            ctrl_sdk_.traj_dt_cnt++;
           }
-          bool reset_ref = (ctrl_sdk_.traj_dt_cnt == 0);  // reset impedance ref on first cmd
-          Eigen::VectorXd K_arm(7);
-          K_arm << 80, 80, 80, 80, 80, 80, 40;  // joint stiffness (Nm/rad), last=wrist
-          Eigen::VectorXd tq_arm = Eigen::VectorXd::Constant(7, 30.0);  // torque limit (Nm)
-          Eigen::VectorXd qt(6);
-          for (int i = 0; i < 6; ++i)
-            qt[i] = (rs->target_position[kNumWheel+i] > 1e-9 || rs->target_position[kNumWheel+i] < -1e-9)
-                    ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
-          bc.SetRightArmCommand(CartesianImpedanceControlCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*10))
-              .SetMinimumTime(kStreamDt * 1.01)
-              .AddTarget("base", "ee_right", T_r, 2.0, M_PI*2, 20.0, M_PI*80)
-              .SetJointStiffness(K_arm)
-              .SetJointTorqueLimit(tq_arm)
-              .SetStopPositionTrackingError(0)
-              .SetStopOrientationTrackingError(0)
-              .SetStopJointPositionTrackingError(0)
-              .SetResetReference(reset_ref))
-            .SetLeftArmCommand(CartesianImpedanceControlCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*10))
-              .SetMinimumTime(kStreamDt * 1.01)
-              .AddTarget("base", "ee_left", T_l, 2.0, M_PI*2, 20.0, M_PI*80)
-              .SetJointStiffness(K_arm)
-              .SetJointTorqueLimit(tq_arm)
-              .SetStopPositionTrackingError(0)
-              .SetStopOrientationTrackingError(0)
-              .SetStopJointPositionTrackingError(0)
-              .SetResetReference(reset_ref))
-            .SetTorsoCommand(JointPositionCommandBuilder()
-              .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*10))
-              .SetPosition(qt).SetMinimumTime(kStreamDt*2));
+          ctrl_sdk_.traj_dt_cnt++;
         }
+        Eigen::VectorXd K_arm(7);
+        K_arm << 80, 80, 80, 80, 80, 80, 40;
+        Eigen::VectorXd tq_arm = Eigen::VectorXd::Constant(7, 30.0);
+        Eigen::VectorXd qt(6);
+        for (int i = 0; i < 6; ++i)
+          qt[i] = (rs->target_position[kNumWheel+i] > 1e-9 || rs->target_position[kNumWheel+i] < -1e-9)
+                  ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
+        BodyComponentBasedCommandBuilder bc;
+        bc.SetRightArmCommand(CartesianImpedanceControlCommandBuilder()
+            .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*10))
+            .SetMinimumTime(kStreamDt * 1.01)
+            .AddTarget("base", "ee_right", T_r, 2.0, M_PI*2, 20.0, M_PI*80)
+            .SetJointStiffness(K_arm)
+            .SetJointTorqueLimit(tq_arm)
+            .SetStopPositionTrackingError(0)
+            .SetStopOrientationTrackingError(0)
+            .SetStopJointPositionTrackingError(0)
+            .SetResetReference(reset_ref))
+          .SetLeftArmCommand(CartesianImpedanceControlCommandBuilder()
+            .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*10))
+            .SetMinimumTime(kStreamDt * 1.01)
+            .AddTarget("base", "ee_left", T_l, 2.0, M_PI*2, 20.0, M_PI*80)
+            .SetJointStiffness(K_arm)
+            .SetJointTorqueLimit(tq_arm)
+            .SetStopPositionTrackingError(0)
+            .SetStopOrientationTrackingError(0)
+            .SetStopJointPositionTrackingError(0)
+            .SetResetReference(reset_ref))
+          .SetTorsoCommand(JointPositionCommandBuilder()
+            .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*10))
+            .SetPosition(qt).SetMinimumTime(kStreamDt*2));
         ComponentBasedCommandBuilder cbc;
         cbc.SetBodyCommand(bc).SetMobilityCommand(mc);
         rc.SetCommand(cbc);
@@ -954,13 +945,15 @@ class Rby1RtNode : public rclcpp::Node {
   bool cmd_sdk_position_teleop_start() {
     if (!cmd_stream_start("CartesianPosition")) return false;
     std::lock_guard<std::mutex> lk(ctrl_sdk_.mtx);
-    ctrl_sdk_.traj_dt_cnt = 0; ctrl_sdk_.new_cmd = false; ctrl_sdk_.enabled = true;
+    ctrl_sdk_.traj_dt_cnt = 0; ctrl_sdk_.new_cmd = false;
+    ctrl_sdk_.cartesian_initialized = false; ctrl_sdk_.enabled = true;
     return true;
   }
   bool cmd_sdk_impedance_teleop_start() {
     if (!cmd_stream_start("CartesianImpedance")) return false;
     std::lock_guard<std::mutex> lk(ctrl_sdk_.mtx);
-    ctrl_sdk_.traj_dt_cnt = 0; ctrl_sdk_.new_cmd = false; ctrl_sdk_.enabled = true;
+    ctrl_sdk_.traj_dt_cnt = 0; ctrl_sdk_.new_cmd = false;
+    ctrl_sdk_.cartesian_initialized = false; ctrl_sdk_.enabled = true;
     return true;
   }
   bool cmd_pose(const Eigen::VectorXd& q, double t = 5.) {
