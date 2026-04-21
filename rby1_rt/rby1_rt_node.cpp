@@ -571,6 +571,12 @@ class Rby1RtNode : public rclcpp::Node {
         for (int i = 0; i < 6; ++i)
           qt[i] = (rs->target_position[kNumWheel+i] > 1e-9 || rs->target_position[kNumWheel+i] < -1e-9)
                   ? rs->target_position[kNumWheel+i] : rs->position[kNumWheel+i];
+        // ── NullspaceJointTarget (self-collision prevention, SDK >= 0.9.0) ────
+        const Eigen::VectorXd q_ready = build_ready_q();
+        const Eigen::VectorXd ns_ra = q_ready.segment(6, 7);   // right arm ready pose
+        const Eigen::VectorXd ns_la = q_ready.segment(13, 7);  // left arm ready pose
+        const Eigen::VectorXd ns_w  = Eigen::VectorXd::Constant(7, 1.0);
+        // ─────────────────────────────────────────────────────────────────────
         BodyComponentBasedCommandBuilder bc;
         bc.SetRightArmCommand(CartesianImpedanceControlCommandBuilder()
             .SetCommandHeader(CommandHeaderBuilder().SetControlHoldTime(kStreamDt*10))
@@ -580,6 +586,7 @@ class Rby1RtNode : public rclcpp::Node {
             .SetJointTorqueLimit(tq_arm)
             .AddJointLimit("right_arm_3", -2.6, -0.5)
             .AddJointLimit("right_arm_5",  0.2,  1.9)
+            .SetNullspaceJointTarget(ns_ra, ns_w) // self-collision prevention
             .SetStopPositionTrackingError(0)
             .SetStopOrientationTrackingError(0)
             .SetStopJointPositionTrackingError(0)
@@ -592,6 +599,7 @@ class Rby1RtNode : public rclcpp::Node {
             .SetJointTorqueLimit(tq_arm)
             .AddJointLimit("left_arm_3", -2.6, -0.5)
             .AddJointLimit("left_arm_5",  0.2,  1.9)
+            .SetNullspaceJointTarget(ns_la, ns_w) // self-collision prevention
             .SetStopPositionTrackingError(0)
             .SetStopOrientationTrackingError(0)
             .SetStopJointPositionTrackingError(0)
