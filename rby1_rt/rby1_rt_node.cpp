@@ -877,12 +877,29 @@ class Rby1RtNode : public rclcpp::Node {
       cleanup_stream("faulted before stream start");
       return false;
     }
-    // stream cancel 후 CM이 Idle로 떨어지는 경우 자동 re-enable
+
+    // StopCommand로 CM flush (SendCommand 완료 후 CM이 스트리밍 준비 안 된 상태 방지)
+    // StopCommand 후 CM이 kIdle로 떨어질 수 있으므로, flush를 re-enable 체크 앞에 배치
+    {
+      RCLCPP_INFO(get_logger(), "cmd_stream_start: flushing CM state before stream creation");
+      RobotCommandBuilder rc;
+      rc.SetCommand(WholeBodyCommandBuilder().SetCommand(StopCommandBuilder()));
+      robot_->SendCommand(rc, 5)->Get();
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    // flush 후 CM 상태 재확인 및 재활성화
+    needs_stop_.store(false);
+    cs = cms_state();
+    if (cs == ControlManagerState::State::kMajorFault ||
+        cs == ControlManagerState::State::kMinorFault) {
+      RCLCPP_ERROR(get_logger(), "cmd_stream_start: CM faulted after flush: cms=%s",
+                   rb::to_string(cs).c_str());
+      return false;
+    }
     if (cs != ControlManagerState::State::kEnabled) {
-      RCLCPP_INFO(get_logger(), "cmd_stream_start: CM is %s — re-enabling",
+      RCLCPP_INFO(get_logger(), "cmd_stream_start: CM is %s after flush — re-enabling",
                   rb::to_string(cs).c_str());
-      needs_stop_.store(false);  // EnableControlManager가 CM 상태를 초기화
-      // EnableControlManager는 timeout 파라미터 없음 — async로 3s 제한
       auto f = std::async(std::launch::async, [this]{ return robot_->EnableControlManager(); });
       if (f.wait_for(std::chrono::seconds(3)) != std::future_status::ready || !f.get()) {
         RCLCPP_ERROR(get_logger(), "cmd_stream_start: EnableControlManager failed/timeout");
@@ -893,23 +910,9 @@ class Rby1RtNode : public rclcpp::Node {
         if (cms_state() == ControlManagerState::State::kEnabled) break;
       }
       if (cms_state() != ControlManagerState::State::kEnabled) {
-        RCLCPP_ERROR(get_logger(), "cmd_stream_start: CM did not become enabled");
+        RCLCPP_ERROR(get_logger(), "cmd_stream_start: CM did not become enabled after flush");
         return false;
       }
-    }
-
-    // 이전 stream 비정상 종료 플래그가 있으면 추가 flush
-    needs_stop_.store(false);
-
-    // 항상 StopCommand로 CM 상태를 clean하게 만든 후 stream 생성
-    // ready_pose 같은 JointPosition SendCommand 완료 후 CM이 Cartesian streaming 준비가
-    // 안 된 상태에서 CreateCommandStream()을 호출하면 MinorFault가 발생하는 것을 방지
-    {
-      RCLCPP_INFO(get_logger(), "cmd_stream_start: flushing CM state before stream creation");
-      RobotCommandBuilder rc;
-      rc.SetCommand(WholeBodyCommandBuilder().SetCommand(StopCommandBuilder()));
-      robot_->SendCommand(rc, 5)->Get();
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
     if (!wait_for_stream_start_window()) {
