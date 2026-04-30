@@ -783,6 +783,24 @@ class Rby1RtNode : public rclcpp::Node {
     }
     // ─────────────────────────────────────────────────────────────────────
 
+    // ── SDK Joint State fallback (always-on, actual position) ────────────
+    // Ensures /rby1_sdk_joint_state is always present for recording module detection.
+    // During CartesianImpedance stream, overridden by set_position() feedback (100Hz).
+    {
+      sensor_msgs::msg::JointState sdk_jmsg;
+      sdk_jmsg.header.stamp = jmsg.header.stamp;
+      for (int i = 0; i < 7; ++i) {
+        sdk_jmsg.name.push_back("right_arm_" + std::to_string(i));
+        sdk_jmsg.position.push_back(rs.position[kNumWheel + 6 + i]);
+      }
+      for (int i = 0; i < 7; ++i) {
+        sdk_jmsg.name.push_back("left_arm_" + std::to_string(i));
+        sdk_jmsg.position.push_back(rs.position[kNumWheel + 13 + i]);
+      }
+      pub_sdk_joints_->publish(sdk_jmsg);
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
     std::string ctrl_str;
     switch (cms.state) {
       case ControlManagerState::State::kEnabled:    ctrl_str = "State.Enabled";    break;
