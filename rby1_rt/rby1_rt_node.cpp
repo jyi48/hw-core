@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -59,6 +60,9 @@ using DynState = dyn::State<ModelType::kRobotDOF>;
 static constexpr double kStreamDt   = 0.01;   // 100 Hz
 static constexpr int    kNumBody    = 20;      // 6 torso + 7 rarm + 7 larm
 static constexpr double kStopWheelT = 0.5;
+// SDK target guardrails for long-running teleop stability.
+static constexpr double kSdkMaxDeltaPos = 0.03;                 // m per received frame
+static constexpr double kSdkMaxDeltaRot = 20.0 * M_PI / 180.0;  // rad per received frame
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -283,8 +287,11 @@ struct CartesianTeleopController {
   bool new_cmd{false};
   int  traj_dt_cnt{0};
   bool cartesian_initialized{false};  // true after FK init on first stream tick
+  int dropped_msg_cnt{0};
+  int clamped_msg_cnt{0};
   Eigen::Matrix4d T_right{Eigen::Matrix4d::Identity()};
   Eigen::Matrix4d T_left{Eigen::Matrix4d::Identity()};
+  std::chrono::steady_clock::time_point last_msg_tp{std::chrono::steady_clock::now()};
   std::mutex mtx;
 };
 
@@ -313,17 +320,35 @@ class Rby1RtNode : public rclcpp::Node {
         "/rby1_sdk_teleop_command", 2,
         [this](const geometry_msgs::msg::PoseArray::SharedPtr m) {
           if (m->poses.size() < 2) return;
+          const Eigen::Matrix4d T_right_in = pose_to_matrix(m->poses[0]);
+          const Eigen::Matrix4d T_left_in  = pose_to_matrix(m->poses[1]);
           std::lock_guard<std::mutex> lk(ctrl_sdk_.mtx);
           if (!ctrl_sdk_.enabled) return;
-          ctrl_sdk_.T_right = pose_to_matrix(m->poses[0]);
-          ctrl_sdk_.T_left  = pose_to_matrix(m->poses[1]);
+          if (!is_finite_pose(T_right_in) || !is_finite_pose(T_left_in)) {
+            ctrl_sdk_.dropped_msg_cnt++;
+            return;
+          }
+          Eigen::Matrix4d T_right_out = T_right_in;
+          Eigen::Matrix4d T_left_out  = T_left_in;
+          if (ctrl_sdk_.cartesian_initialized || ctrl_sdk_.traj_dt_cnt > 0) {
+            bool clamped_r = false, clamped_l = false;
+            T_right_out = clamp_pose_step(ctrl_sdk_.T_right, T_right_in, clamped_r);
+            T_left_out  = clamp_pose_step(ctrl_sdk_.T_left,  T_left_in,  clamped_l);
+            if (clamped_r || clamped_l) ctrl_sdk_.clamped_msg_cnt++;
+          }
+          ctrl_sdk_.T_right = T_right_out;
+          ctrl_sdk_.T_left  = T_left_out;
           ctrl_sdk_.new_cmd = true;
+          ctrl_sdk_.last_msg_tp = std::chrono::steady_clock::now();
         });
 
     pub_status_ = create_publisher<std_msgs::msg::String>("/rby1_status", 2);
     pub_joints_ = create_publisher<sensor_msgs::msg::JointState>("/rby1_status_joint", 2);
     // ── PoseArray → Joint Feedback Publisher ─────────────────────────────
     pub_sdk_joints_ = create_publisher<sensor_msgs::msg::JointState>("/rby1_sdk_joint_state", 2);
+    // ─────────────────────────────────────────────────────────────────────
+    // ── EE Pose Publisher (FK from robot state, always-on) ───────────────
+    pub_ee_pose_ = create_publisher<geometry_msgs::msg::PoseArray>("/rby1_ee_pose", 2);
     // ─────────────────────────────────────────────────────────────────────
 
     action_server_ = rclcpp_action::create_server<Rby1Command>(
@@ -344,6 +369,38 @@ class Rby1RtNode : public rclcpp::Node {
   }
 
  private:
+  static bool is_finite_pose(const Eigen::Matrix4d& T) { return T.allFinite(); }
+
+  static Eigen::Matrix4d clamp_pose_step(
+      const Eigen::Matrix4d& prev, const Eigen::Matrix4d& next, bool& clamped) {
+    clamped = false;
+    Eigen::Matrix4d out = next;
+
+    const Eigen::Vector3d p_prev = prev.block<3,1>(0,3);
+    Eigen::Vector3d p_next = next.block<3,1>(0,3);
+    const Eigen::Vector3d dp = p_next - p_prev;
+    const double dp_norm = dp.norm();
+    if (dp_norm > kSdkMaxDeltaPos) {
+      p_next = p_prev + dp / dp_norm * kSdkMaxDeltaPos;
+      out.block<3,1>(0,3) = p_next;
+      clamped = true;
+    }
+
+    Eigen::Quaterniond q_prev(prev.block<3,3>(0,0));
+    Eigen::Quaterniond q_next(next.block<3,3>(0,0));
+    q_prev.normalize();
+    q_next.normalize();
+    const double dot = std::clamp(std::abs(q_prev.dot(q_next)), 0.0, 1.0);
+    const double angle = 2.0 * std::acos(dot);
+    if (std::isfinite(angle) && angle > kSdkMaxDeltaRot) {
+      const double ratio = kSdkMaxDeltaRot / angle;
+      const Eigen::Quaterniond q_lim = q_prev.slerp(ratio, q_next);
+      out.block<3,3>(0,0) = q_lim.toRotationMatrix();
+      clamped = true;
+    }
+    return out;
+  }
+
   std::shared_ptr<Robot<ModelType>>                     robot_;
   std::unique_ptr<RobotCommandStreamHandler<ModelType>> stream_;
   std::shared_ptr<DynRobot>                             dyn_;
@@ -378,6 +435,8 @@ class Rby1RtNode : public rclcpp::Node {
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub_status_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_joints_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pub_sdk_joints_;  // PoseArray → Joint Feedback
+  rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pub_ee_pose_;   // EE Pose (FK, always-on)
+  std::shared_ptr<DynState> dyn_state_ee_;  // separate state for on_state FK (thread-safe)
   rclcpp_action::Server<Rby1Command>::SharedPtr action_server_;
   std::thread stream_thread_;
 
@@ -621,8 +680,22 @@ class Rby1RtNode : public rclcpp::Node {
       }
 
       if (stream_ && stream_->IsDone()) {
-        RCLCPP_ERROR(get_logger(), "stream died before SendCommand: cms=%s ctr=%s sdk_cnt=%d",
-                     rb::to_string(cms_state()).c_str(), ctr.c_str(), ctrl_sdk_.traj_dt_cnt);
+        const auto now_tp = std::chrono::steady_clock::now();
+        double sdk_age_ms = -1.0;
+        int dropped = 0, clamped = 0;
+        bool had_new = false;
+        {
+          std::lock_guard<std::mutex> lk(ctrl_sdk_.mtx);
+          sdk_age_ms = std::chrono::duration<double, std::milli>(now_tp - ctrl_sdk_.last_msg_tp).count();
+          dropped = ctrl_sdk_.dropped_msg_cnt;
+          clamped = ctrl_sdk_.clamped_msg_cnt;
+          had_new = ctrl_sdk_.new_cmd;
+        }
+        RCLCPP_ERROR(
+            get_logger(),
+            "stream died before SendCommand: cms=%s ctr=%s sdk_cnt=%d sdk_age_ms=%.1f new_cmd=%d drop=%d clamp=%d",
+            rb::to_string(cms_state()).c_str(), ctr.c_str(), ctrl_sdk_.traj_dt_cnt,
+            sdk_age_ms, static_cast<int>(had_new), dropped, clamped);
         cleanup_stream("stream died before SendCommand");
         sleep_until_abs(next, dt_ns);
         continue;
@@ -660,8 +733,14 @@ class Rby1RtNode : public rclcpp::Node {
           // ───────────────────────────────────────────────────────────────
         }
       } catch (const std::exception& e) {
-        RCLCPP_ERROR(get_logger(), "stream SendCommand threw: %s | cms=%s",
-                     e.what(), rb::to_string(cms_state()).c_str());
+        double sdk_age_ms = -1.0;
+        {
+          std::lock_guard<std::mutex> lk(ctrl_sdk_.mtx);
+          sdk_age_ms = std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - ctrl_sdk_.last_msg_tp).count();
+        }
+        RCLCPP_ERROR(get_logger(), "stream SendCommand threw: %s | cms=%s ctr=%s sdk_age_ms=%.1f",
+                     e.what(), rb::to_string(cms_state()).c_str(), ctr.c_str(), sdk_age_ms);
         cleanup_stream("stream SendCommand threw");
       }
       sleep_until_abs(next, dt_ns);
@@ -680,6 +759,29 @@ class Rby1RtNode : public rclcpp::Node {
     for (double v : rs.velocity) jmsg.velocity.push_back(v);
     for (double v : rs.torque)   jmsg.effort.push_back(v);
     pub_joints_->publish(jmsg);
+
+    // ── EE Pose Publisher (FK from robot state, always-on) ───────────────
+    if (dyn_state_ee_) {
+      dyn_state_ee_->SetQ(Eigen::Map<const Eigen::VectorXd>(rs.position.data(), rs.position.size()));
+      dyn_->ComputeForwardKinematics(dyn_state_ee_);
+      const Eigen::Matrix4d T_r = dyn_->ComputeTransformation(dyn_state_ee_, 0, 1);
+      const Eigen::Matrix4d T_l = dyn_->ComputeTransformation(dyn_state_ee_, 0, 2);
+      auto mat_to_pose = [](const Eigen::Matrix4d& T) {
+        geometry_msgs::msg::Pose p;
+        p.position.x = T(0,3); p.position.y = T(1,3); p.position.z = T(2,3);
+        Eigen::Quaterniond q(Eigen::Matrix3d(T.block<3,3>(0,0)));
+        p.orientation.x = q.x(); p.orientation.y = q.y();
+        p.orientation.z = q.z(); p.orientation.w = q.w();
+        return p;
+      };
+      geometry_msgs::msg::PoseArray ee_msg;
+      ee_msg.header.stamp = jmsg.header.stamp;
+      ee_msg.header.frame_id = "base";
+      ee_msg.poses.push_back(mat_to_pose(T_r));  // poses[0] = ee_right
+      ee_msg.poses.push_back(mat_to_pose(T_l));  // poses[1] = ee_left
+      pub_ee_pose_->publish(ee_msg);
+    }
+    // ─────────────────────────────────────────────────────────────────────
 
     std::string ctrl_str;
     switch (cms.state) {
@@ -781,6 +883,7 @@ class Rby1RtNode : public rclcpp::Node {
     ctrl_jp_.enabled  = false;
     ctrl_jip_.enabled = false;
     ctrl_sdk_.enabled = false;
+    ctrl_sdk_.new_cmd = false;
   }
 
   bool wait_for_stream_start_window(std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) {
@@ -855,7 +958,8 @@ class Rby1RtNode : public rclcpp::Node {
     robot_->SetParameter("default.linear_acceleration_limit", "5");
     std::this_thread::sleep_for(std::chrono::seconds(1));
     dyn_       = robot_->GetDynamics();
-    dyn_state_ = dyn_->MakeState({"base","ee_right","ee_left","link_torso_5"}, ModelType::kRobotJointNames);
+    dyn_state_    = dyn_->MakeState({"base","ee_right","ee_left","link_torso_5"}, ModelType::kRobotJointNames);
+    dyn_state_ee_ = dyn_->MakeState({"base","ee_right","ee_left"}, ModelType::kRobotJointNames);
     robot_->StartStateUpdate(
         [this](const RobotState<ModelType>& rs, const ControlManagerState& cms){ on_state(rs, cms); },
         100.0);
@@ -959,6 +1063,8 @@ class Rby1RtNode : public rclcpp::Node {
     }
 
     stream_ = robot_->CreateCommandStream();
+    // Short grace period helps avoid immediate IsDone() in CM transition boundaries.
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
     if (stream_->IsDone()) {
       RCLCPP_ERROR(get_logger(), "stream already closed at creation: cms=%s",
                    rb::to_string(cms_state()).c_str());
